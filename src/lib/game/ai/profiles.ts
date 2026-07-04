@@ -1,0 +1,53 @@
+import { AIDifficulty } from '../../../types';
+import { DifficultyProfile } from './types';
+
+export const DIFFICULTY_PROFILES: Record<AIDifficulty, DifficultyProfile> = {
+  SQUIRE: {
+    name: 'Squire',
+    maxDepth: 1,
+    randomness: 8.0,
+    errorRate: 0.30,
+    tacticalAggressiveness: 0.6,
+    kingSafetyWeight: 0.3,
+    resourceValuation: 0.4,
+    positionalWeight: 0.2,
+    allowSupers: true,
+    allowAbilities: true,
+  },
+  KNIGHT: {
+    name: 'Knight',
+    maxDepth: 2,
+    randomness: 2.0,
+    errorRate: 0.12,
+    tacticalAggressiveness: 1.0,
+    kingSafetyWeight: 0.9,
+    resourceValuation: 1.0,
+    positionalWeight: 0.8,
+    allowSupers: true,
+    allowAbilities: true,
+  },
+  GENERAL: {
+    name: 'General',
+    maxDepth: 3,
+    randomness: 0.2,
+    errorRate: 0.02,
+    tacticalAggressiveness: 1.4,
+    kingSafetyWeight: 1.4,
+    resourceValuation: 1.4,
+    positionalWeight: 1.3,
+    allowSupers: true,
+    allowAbilities: true,
+  },
+  SOVEREIGN: {
+    name: 'Sovereign',
+    maxDepth: 4,
+    randomness: 0.0,
+    errorRate: 0.0,
+    tacticalAggressiveness: 1.8,
+    kingSafetyWeight: 1.8,
+    resourceValuation: 1.8,
+    positionalWeight: 1.8,
+    allowSupers: true,
+    allowAbilities: true,
+  },
+};

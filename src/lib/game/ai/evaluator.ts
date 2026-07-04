@@ -1,0 +1,1270 @@
+import { GameState, Position, Piece, PieceColor, PieceType } from '../../../types';
+import { DIFFICULTY_PROFILES } from './profiles';
+import { DifficultyProfile, AIMove } from './types';
+
+// Base material values
+export const MATERIAL_VALUES: Record<PieceType, number> = {
+  KING: 10000,
+  QUEEN: 90,
+  ROOK: 55,
+  KNIGHT: 35,
+  BISHOP: 30,
+  PAWN: 10,
+  ROYAL_GUARD: 22,
+};
+
+// Helper: Manhattan distance
+function getDistance(pos1: Position, pos2: Position): number {
+  return Math.abs(pos1.r - pos2.r) + Math.abs(pos1.c - pos2.c);
+}
+
+export type GamePhase = 'OPENING' | 'MIDDLEGAME' | 'ENDGAME';
+
+export function determineGamePhase(gameState: GameState): GamePhase {
+  let totalPieces = 0;
+  let majorPiecesDeveloped = 0;
+  let totalMajorPieces = 0;
+  let currentNonKingMaterial = 0;
+  let totalValor = 0;
+  let totalResolve = 0;
+  let activeCooldowns = 0;
+  let advancedPawns = 0;
+  let kingsThreatLevel = 0;
+
+  // Locate kings
+  let whiteKingPos: Position | null = null;
+  let blackKingPos: Position | null = null;
+
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = gameState.board[r][c];
+      if (p && p.type === 'KING') {
+        if (p.color === 'WHITE') whiteKingPos = { r, c };
+        else blackKingPos = { r, c };
+      }
+    }
+  }
+
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = gameState.board[r][c];
+      if (!p) continue;
+
+      totalPieces++;
+
+      if (p.type !== 'KING') {
+        currentNonKingMaterial += MATERIAL_VALUES[p.type] || 0;
+      }
+
+      // Check major pieces developed
+      if (p.type === 'QUEEN' || p.type === 'ROOK' || p.type === 'BISHOP' || p.type === 'KNIGHT' || p.type === 'ROYAL_GUARD') {
+        totalMajorPieces++;
+        const initialRank = p.color === 'WHITE' ? 7 : 0;
+        if (r !== initialRank) {
+          majorPiecesDeveloped++;
+        }
+      }
+
+      // Check advanced pawns (close to promotion: 3 steps advanced)
+      if (p.type === 'PAWN') {
+        const pawnProgress = p.color === 'WHITE' ? (6 - r) : (r - 1);
+        if (pawnProgress >= 3) {
+          advancedPawns++;
+        }
+      }
+
+      // Accumulate resources & cooldowns
+      totalValor += p.valor;
+      totalResolve += p.resolve;
+      if (p.cooldowns.ability > 0) activeCooldowns++;
+      if (p.cooldowns.passive > 0) activeCooldowns++;
+
+      // Check threat levels to both kings
+      const enemyKing = p.color === 'WHITE' ? blackKingPos : whiteKingPos;
+
+      if (enemyKing) {
+        const dist = Math.abs(r - enemyKing.r) + Math.abs(c - enemyKing.c);
+        if (dist <= 3) {
+          kingsThreatLevel += (4 - dist);
+        }
+      }
+    }
+  }
+
+  // Material ratio (out of 820 total starting non-king material)
+  const materialRatio = currentNonKingMaterial / 820;
+
+  // Development ratio of remaining major pieces
+  const developmentRatio = totalMajorPieces > 0 ? majorPiecesDeveloped / totalMajorPieces : 1.0;
+
+  // Define score weights to determine phase
+  let openingScore = 10;
+  let middlegameScore = 0;
+  let endgameScore = 0;
+
+  // 1. Piece Count & Material transitions
+  if (materialRatio < 0.45 || totalPieces <= 10) {
+    endgameScore += 18;
+  } else if (materialRatio < 0.70 || totalPieces <= 18) {
+    middlegameScore += 6;
+    endgameScore += 8;
+  } else {
+    openingScore += 6;
+    middlegameScore += 2;
+  }
+
+  // 2. Turn count (auxiliary)
+  if (gameState.turn <= 4) {
+    openingScore += 10;
+  } else if (gameState.turn > 15) {
+    endgameScore += 6;
+  } else {
+    middlegameScore += 6;
+  }
+
+  // 3. Piece Development
+  if (developmentRatio > 0.55) {
+    openingScore -= 10;
+    middlegameScore += 10;
+  } else if (developmentRatio > 0.30) {
+    openingScore -= 4;
+    middlegameScore += 6;
+  } else {
+    openingScore += 6;
+  }
+
+  // 4. Ability Usage & Resource progression
+  const resourceIntensity = totalValor + totalResolve + activeCooldowns * 2;
+  if (resourceIntensity > 14) {
+    openingScore -= 6;
+    middlegameScore += 8;
+  } else if (resourceIntensity > 6) {
+    middlegameScore += 4;
+  }
+
+  // 5. Pawn Promotion & Advanced Pawns
+  if (advancedPawns > 0) {
+    openingScore -= 5;
+    middlegameScore += 3;
+    endgameScore += advancedPawns * 3.0;
+  }
+
+  // 6. Threat level / Battle density
+  if (kingsThreatLevel > 8) {
+    openingScore -= 6;
+    middlegameScore += 6;
+  }
+
+  // Resolve phase
+  if (endgameScore >= middlegameScore && endgameScore >= openingScore) {
+    return 'ENDGAME';
+  } else if (middlegameScore >= openingScore) {
+    return 'MIDDLEGAME';
+  } else {
+    return 'OPENING';
+  }
+}
+
+// Helper to check if a position is valid on an 8x8 board
+function isValidPos(r: number, c: number): boolean {
+  return r >= 0 && r < 8 && c >= 0 && c < 8;
+}
+
+/**
+ * High-performance threat and attack checker mirroring the rules engine.
+ * Determines if piece `p` at `(r, c)` can attack `(tr, tc)` under current board conditions.
+ */
+export function canPieceAttackTarget(
+  board: (Piece | null)[][],
+  p: Piece,
+  r: number,
+  c: number,
+  tr: number,
+  tc: number
+): boolean {
+  if (p.conditions.frozen > 0) return false;
+  if (p.bastionTurns && p.bastionTurns > 0) return false;
+
+  const dr = tr - r;
+  const dc = tc - c;
+  const absDr = Math.abs(dr);
+  const absDc = Math.abs(dc);
+
+  switch (p.type) {
+    case 'KING': {
+      const range = p.conditions.haste ? 2 : 1;
+      return absDr <= range && absDc <= range && (dr !== 0 || dc !== 0);
+    }
+    case 'ROYAL_GUARD':
+      return absDr <= 1 && absDc <= 1 && (dr !== 0 || dc !== 0);
+    case 'PAWN': {
+      const forward = p.color === 'WHITE' ? -1 : 1;
+      return dr === forward && absDc === 1;
+    }
+    case 'KNIGHT':
+      return (absDr === 2 && absDc === 1) || (absDr === 1 && absDc === 2);
+    case 'BISHOP': {
+      if (absDr !== absDc || dr === 0) return false;
+      const stepR = Math.sign(dr);
+      const stepC = Math.sign(dc);
+      let curR = r + stepR;
+      let curC = c + stepC;
+      while (curR !== tr || curC !== tc) {
+        if (board[curR]?.[curC]) return false;
+        curR += stepR;
+        curC += stepC;
+      }
+      return true;
+    }
+    case 'ROOK': {
+      if ((dr !== 0 && dc !== 0) || (dr === 0 && dc === 0)) return false;
+      const stepR = dr === 0 ? 0 : Math.sign(dr);
+      const stepC = dc === 0 ? 0 : Math.sign(dc);
+      let curR = r + stepR;
+      let curC = c + stepC;
+      while (curR !== tr || curC !== tc) {
+        if (board[curR]?.[curC]) return false;
+        curR += stepR;
+        curC += stepC;
+      }
+      return true;
+    }
+    case 'QUEEN': {
+      const isDiag = absDr === absDc && dr !== 0;
+      const isOrth = (dr === 0 || dc === 0) && (dr !== 0 || dc !== 0);
+      if (!isDiag && !isOrth) return false;
+      const stepR = dr === 0 ? 0 : Math.sign(dr);
+      const stepC = dc === 0 ? 0 : Math.sign(dc);
+      let curR = r + stepR;
+      let curC = c + stepC;
+      while (curR !== tr || curC !== tc) {
+        if (board[curR]?.[curC]) return false;
+        curR += stepR;
+        curC += stepC;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Performs a comprehensive multi-factor safety evaluation of a King.
+ * This is scaled automatically according to the AI difficulty profile.
+ */
+/**
+ * Performs a comprehensive multi-factor safety evaluation of a King.
+ * This is scaled automatically according to the AI difficulty profile.
+ */
+export function calculateKingSafetyScore(
+  gameState: GameState,
+  kingColor: PieceColor,
+  kingPos: Position,
+  phase: GamePhase,
+  profileName: string
+): number {
+  const board = gameState.board;
+  const kr = kingPos.r;
+  const kc = kingPos.c;
+  const enemyColor = kingColor === 'WHITE' ? 'BLACK' : 'WHITE';
+  
+  let score = 0;
+
+  // Find the actual king piece properties
+  const kingPiece = board[kr][kc];
+  if (!kingPiece) return 0;
+
+  // Pre-calculate empty surrounding squares
+  const emptySurrounding: Position[] = [];
+  const nrNcIsThreatened: boolean[] = [];
+  for (let dr = -1; dr <= 1; dr++) {
+    for (let dc = -1; dc <= 1; dc++) {
+      if (dr === 0 && dc === 0) continue;
+      const nr = kr + dr;
+      const nc = kc + dc;
+      if (isValidPos(nr, nc) && !board[nr][nc]) {
+        emptySurrounding.push({ r: nr, c: nc });
+        nrNcIsThreatened.push(false);
+      }
+    }
+  }
+
+  // Single pass board scan to gather ALL variables in O(1) loop of 64 cells
+  let directThreatCount = 0;
+  let maxThreatDamage = 0;
+  let surroundingEnemies = 0;
+  let alliedDefendersCount = 0;
+  let adjacentAlliesCount = 0;
+  let shieldingAlliesAhead = 0;
+  let activeGuardingAlly = false;
+  const isWhite = kingColor === 'WHITE';
+
+  // For col slider detection
+  let hasColSlider = false;
+  let colSliderRow = -1;
+
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = board[r][c];
+      if (!p) continue;
+
+      const dist = Math.abs(r - kr) + Math.abs(c - kc);
+
+      if (p.color === enemyColor) {
+        // Direct attack to King
+        if (canPieceAttackTarget(board, p, r, c, kr, kc)) {
+          directThreatCount++;
+          const pieceAtk = p.atk || 0;
+          if (pieceAtk > maxThreatDamage) {
+            maxThreatDamage = pieceAtk;
+          }
+        }
+
+        // Surrounding enemies (distance <= 1)
+        if (dist === 1 || (Math.abs(r - kr) <= 1 && Math.abs(c - kc) <= 1)) {
+          surroundingEnemies++;
+        }
+
+        // Section 3: Exposure to High-Damage Units
+        if (p.type === 'QUEEN' || p.type === 'ROOK' || p.type === 'KNIGHT') {
+          if (dist <= 3) {
+            let penalty = (4 - dist) * 15;
+            if (p.type === 'QUEEN') penalty *= 1.5;
+            score -= penalty;
+          }
+        }
+
+        // Section 4: Mark threatened empty surrounding squares
+        for (let idx = 0; idx < emptySurrounding.length; idx++) {
+          if (!nrNcIsThreatened[idx]) {
+            const target = emptySurrounding[idx];
+            if (canPieceAttackTarget(board, p, r, c, target.r, target.c)) {
+              nrNcIsThreatened[idx] = true;
+            }
+          }
+        }
+
+        // Slider in column detection
+        if (c === kc && (p.type === 'ROOK' || p.type === 'QUEEN')) {
+          hasColSlider = true;
+          colSliderRow = r;
+        }
+
+      } else { // Allied piece
+        if (dist === 1) {
+          adjacentAlliesCount++;
+          
+          // Specific defensive coordination pieces
+          if (p.type === 'ROYAL_GUARD') {
+            score += 25; // Royal Guards stand next to the King
+          } else if (p.type === 'ROOK') {
+            score += 15; // Rooks provide shielding
+          } else if (p.type === 'PAWN') {
+            score += 10; // Pawns form front line
+          }
+        } else if (dist <= 2) {
+          if (p.type === 'BISHOP') {
+            score += 15; // High Cleric nearby for healing
+          }
+        }
+
+        // Section 2: Defending/controlling the King's square
+        if (p.type !== 'KING' && canPieceAttackTarget(board, p, r, c, kr, kc)) {
+          alliedDefendersCount++;
+        }
+
+        // Section 2: Active guarding check
+        if (p.conditions.guarding) {
+          activeGuardingAlly = true;
+        }
+
+        // Section 6: Shielding allies ahead
+        const isAheadOfKing = isWhite ? (r < kr) : (r > kr);
+        const isInNearbyColumns = Math.abs(c - kc) <= 1;
+        if (isAheadOfKing && isInNearbyColumns) {
+          shieldingAlliesAhead++;
+        }
+      }
+    }
+  }
+
+  // --- 1. DIRECT THREATS ---
+  if (directThreatCount > 0) {
+    if (profileName === 'Squire') {
+      score -= directThreatCount * 15;
+    } else if (profileName === 'Knight') {
+      score -= directThreatCount * 45 + maxThreatDamage * 10;
+    } else { // General or Sovereign
+      score -= directThreatCount * 120 + maxThreatDamage * 30;
+      if (directThreatCount > 1) {
+        score -= 150;
+      }
+    }
+  }
+
+  // Squire only reacts to obvious threats and immediate surrounding enemies
+  if (profileName === 'Squire') {
+    score -= surroundingEnemies * 8;
+    return score;
+  }
+
+  // --- 2. CONTROL AND DEFENDERS ---
+  score += alliedDefendersCount * 8 + adjacentAlliesCount * 6;
+
+  if (kingPiece.conditions.guarded > 0) {
+    score += kingPiece.conditions.guarded * 20;
+  }
+
+  if (activeGuardingAlly) {
+    score += 30;
+  }
+
+  if (adjacentAlliesCount === 0) {
+    score -= 40;
+  }
+
+  // --- 4. FUTURE ESCAPE ROUTES ---
+  let safeEscapeRoutes = 0;
+  for (let idx = 0; idx < emptySurrounding.length; idx++) {
+    if (!nrNcIsThreatened[idx]) {
+      safeEscapeRoutes++;
+    }
+  }
+
+  if (safeEscapeRoutes === 0) {
+    score -= 60;
+  } else if (safeEscapeRoutes === 1) {
+    score -= 25;
+  } else if (safeEscapeRoutes >= 3) {
+    score += 15;
+  }
+
+  // --- 5. LINE OF SIGHT FOR DANGEROUS ABILITIES ---
+  const queenDirs = [[-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]];
+  for (const [dr, dc] of queenDirs) {
+    for (let i = 1; i <= 8; i++) {
+      const tr = kr + dr * i;
+      const tc = kc + dc * i;
+      if (!isValidPos(tr, tc)) break;
+      const p = board[tr][tc];
+      if (p) {
+        if (p.color === enemyColor && p.type === 'QUEEN' && p.cooldowns.ability === 0) {
+          score -= 30; // Cold Charm risk
+        }
+        break;
+      }
+    }
+  }
+
+  const bishopDirs = [[-1,-1], [-1,1], [1,-1], [1,1]];
+  for (const [dr, dc] of bishopDirs) {
+    for (let i = 1; i <= 8; i++) {
+      const tr = kr + dr * i;
+      const tc = kc + dc * i;
+      if (!isValidPos(tr, tc)) break;
+      const p = board[tr][tc];
+      if (p) {
+        if (p.color === enemyColor && p.type === 'BISHOP' && p.cooldowns.ability === 0) {
+          score -= 15; // Divine Judgement risk
+        }
+        break;
+      }
+    }
+  }
+
+  // --- 6. POSITIONING RELATIVE TO DEFENSE LINES ---
+  score += shieldingAlliesAhead * 6;
+
+  if (phase !== 'ENDGAME') {
+    const isExposedInFront = isWhite ? (kr <= 4) : (kr >= 3);
+    if (isExposedInFront && shieldingAlliesAhead === 0) {
+      score -= 50;
+    }
+  }
+
+  // --- 7. GENERAL / SOVEREIGN PROACTIVE DEFENSIVE AND THREAT PREDICTION ---
+  if (profileName === 'General' || profileName === 'Sovereign') {
+    if (hasColSlider) {
+      let blockers = 0;
+      const minRow = Math.min(colSliderRow, kr);
+      const maxRow = Math.max(colSliderRow, kr);
+      for (let row = minRow + 1; row < maxRow; row++) {
+        if (board[row][kc]) blockers++;
+      }
+      if (blockers === 0) {
+        score -= 40;
+      } else if (blockers === 1) {
+        score -= 15;
+      }
+    }
+
+    if (profileName === 'Sovereign') {
+      const isExtremelyDeep = isWhite ? (kr >= 6) : (kr <= 1);
+      if (isExtremelyDeep) {
+        score += 15;
+      }
+    }
+  }
+
+  return score;
+}
+
+export function evaluateBoard(
+  gameState: GameState,
+  evaluatingColor: PieceColor,
+  profile: DifficultyProfile = DIFFICULTY_PROFILES.SOVEREIGN,
+  lastMove?: AIMove
+) {
+  const phase = determineGamePhase(gameState);
+
+  let materialSelf = 0;
+  let materialEnemy = 0;
+  let positionalSelf = 0;
+  let positionalEnemy = 0;
+  let resourcesSelf = 0;
+  let resourcesEnemy = 0;
+  let safetySelf = 0;
+  let safetyEnemy = 0;
+
+  // Compile active pieces first for dramatic O(N) evaluation speedups
+  const selfPieces: { p: Piece; r: number; c: number }[] = [];
+  const enemyPieces: { p: Piece; r: number; c: number }[] = [];
+  
+  let selfKingPos: Position | null = null;
+  let enemyKingPos: Position | null = null;
+
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = gameState.board[r][c];
+      if (p) {
+        if (p.color === evaluatingColor) {
+          selfPieces.push({ p, r, c });
+          if (p.type === 'KING') {
+            selfKingPos = { r, c };
+          }
+        } else {
+          enemyPieces.push({ p, r, c });
+          if (p.type === 'KING') {
+            enemyKingPos = { r, c };
+          }
+        }
+      }
+    }
+  }
+
+  // Iterate self pieces
+  for (const entry of selfPieces) {
+    const { p, r, c } = entry;
+    const baseVal = MATERIAL_VALUES[p.type];
+
+    // 1. Material value scaled by remaining HP
+    const hpRatio = p.maxHp > 0 ? p.hp / p.maxHp : 1.0;
+    const hpBaseline = phase === 'ENDGAME' ? 0.6 : 0.4;
+    let rawMaterial = baseVal * (hpBaseline + (1.0 - hpBaseline) * hpRatio);
+
+    // 2. Charmed material adjustment (Temporary control)
+    const isCharmed = p.conditions.charmed > 0;
+    if (isCharmed) {
+      if (p.conditions.charmed === 1) {
+        rawMaterial *= 0.2; // Value drops dramatically since it returns to opponent on next half-turn
+      } else {
+        rawMaterial *= 0.6;
+      }
+    }
+
+    materialSelf += rawMaterial;
+
+    // 3. Positional values
+    let posScore = 0;
+
+    // Central board control (ranks 2-5, columns 2-5)
+    if (r >= 2 && r <= 5 && c >= 2 && c <= 5) {
+      if (phase === 'OPENING') posScore += 3.5;
+      else if (phase === 'MIDDLEGAME') posScore += 2.0;
+      else posScore += 1.0;
+    }
+
+    // Piece coordination coverage
+    if (selfKingPos && p.type !== 'KING') {
+      const distToKing = getDistance({ r, c }, selfKingPos);
+      if (distToKing <= 2) {
+        posScore += 1.5;
+      }
+    }
+
+    // Pawn chains
+    if (p.type === 'PAWN') {
+      const supportRow = p.color === 'WHITE' ? r + 1 : r - 1;
+      const isSupportedLeft = c > 0 && gameState.board[supportRow]?.[c - 1]?.type === 'PAWN' && gameState.board[supportRow]?.[c - 1]?.color === p.color;
+      const isSupportedRight = c < 7 && gameState.board[supportRow]?.[c + 1]?.type === 'PAWN' && gameState.board[supportRow]?.[c + 1]?.color === p.color;
+      if (isSupportedLeft || isSupportedRight) {
+        posScore += 1.5;
+      }
+    }
+
+    // Piece-specific positional heuristics
+    let specScore = 0;
+    switch (p.type) {
+      case 'PAWN': {
+        const pawnRowProgress = p.color === 'WHITE' ? (6 - r) : (r - 1);
+        const advancementMultiplier = profile.name === 'Squire' ? 2.0 : profile.name === 'Knight' ? 4.0 : 5.5;
+        let progressBonus = pawnRowProgress * advancementMultiplier;
+        
+        let promoBonus = pawnRowProgress >= 4 ? 12.0 : 0.0;
+        if (phase === 'ENDGAME') {
+          progressBonus = pawnRowProgress * (profile.name === 'Squire' ? 5.0 : 7.5);
+          promoBonus = pawnRowProgress >= 4 ? 35.0 : 0.0;
+        }
+        specScore += progressBonus + promoBonus;
+        break;
+      }
+
+      case 'KNIGHT': {
+        const distToCenter = Math.abs(3.5 - r) + Math.abs(3.5 - c);
+        specScore += (6 - distToCenter) * 0.8;
+        break;
+      }
+
+      case 'ROYAL_GUARD':
+        if (selfKingPos) {
+          const distToKing = getDistance({ r, c }, selfKingPos);
+          if (distToKing <= 2) {
+            specScore += 5.0;
+          }
+        }
+        break;
+
+      case 'ROOK':
+        specScore += 1.5;
+        break;
+
+      case 'BISHOP':
+        specScore += 1.0;
+        break;
+
+      case 'QUEEN':
+        specScore += 2.0;
+        break;
+    }
+
+    if (phase === 'OPENING' && p.type !== 'PAWN' && p.type !== 'KING') {
+      specScore *= 1.5;
+    }
+    posScore += specScore;
+
+    // 4. Lightweight mobility heuristic
+    let pieceMobility = 0;
+    switch (p.type) {
+      case 'KNIGHT': {
+        const knightMoves = [[-2,-1], [-2,1], [-1,-2], [-1,2], [1,-2], [1,2], [2,-1], [2,1]];
+        for (const [dr, dc] of knightMoves) {
+          const nr = r + dr, nc = c + dc;
+          if (isValidPos(nr, nc)) {
+            const target = gameState.board[nr][nc];
+            if (!target) pieceMobility += 0.5;
+            else if (target.color !== p.color) pieceMobility += 0.8;
+          }
+        }
+        break;
+      }
+      case 'BISHOP': {
+        const dirs = [[-1,-1], [-1,1], [1,-1], [1,1]];
+        for (const [dr, dc] of dirs) {
+          for (let i = 1; i <= 3; i++) {
+            const nr = r + dr * i, nc = c + dc * i;
+            if (!isValidPos(nr, nc)) break;
+            const target = gameState.board[nr][nc];
+            if (!target) pieceMobility += 0.4;
+            else {
+              if (target.color !== p.color) pieceMobility += 0.6;
+              break;
+            }
+          }
+        }
+        break;
+      }
+      case 'ROOK': {
+        const dirs = [[-1,0], [1,0], [0,-1], [0,1]];
+        for (const [dr, dc] of dirs) {
+          for (let i = 1; i <= 3; i++) {
+            const nr = r + dr * i, nc = c + dc * i;
+            if (!isValidPos(nr, nc)) break;
+            const target = gameState.board[nr][nc];
+            if (!target) pieceMobility += 0.4;
+            else {
+              if (target.color !== p.color) pieceMobility += 0.6;
+              break;
+            }
+          }
+        }
+        break;
+      }
+      case 'QUEEN': {
+        const dirs = [[-1,-1], [-1,1], [1,-1], [1,1], [-1,0], [1,0], [0,-1], [0,1]];
+        for (const [dr, dc] of dirs) {
+          for (let i = 1; i <= 2; i++) {
+            const nr = r + dr * i, nc = c + dc * i;
+            if (!isValidPos(nr, nc)) break;
+            const target = gameState.board[nr][nc];
+            if (!target) pieceMobility += 0.4;
+            else {
+              if (target.color !== p.color) pieceMobility += 0.6;
+              break;
+            }
+          }
+        }
+        break;
+      }
+      case 'PAWN': {
+        const forward = p.color === 'WHITE' ? -1 : 1;
+        const nr = r + forward;
+        if (isValidPos(nr, c) && !gameState.board[nr][c]) pieceMobility += 0.5;
+        for (const dc of [-1, 1]) {
+          const nc = c + dc;
+          if (isValidPos(nr, nc)) {
+            const target = gameState.board[nr][nc];
+            if (target && target.color !== p.color) pieceMobility += 0.8;
+          }
+        }
+        break;
+      }
+      default: {
+        for (let dr = -1; dr <= 1; dr++) {
+          for (let dc = -1; dc <= 1; dc++) {
+            if (dr === 0 && dc === 0) continue;
+            const nr = r + dr, nc = c + dc;
+            if (isValidPos(nr, nc)) {
+              const target = gameState.board[nr][nc];
+              if (!target) pieceMobility += 0.3;
+              else if (target.color !== p.color) pieceMobility += 0.5;
+            }
+          }
+        }
+        break;
+      }
+    }
+    posScore += pieceMobility * 0.4;
+
+    positionalSelf += posScore;
+
+    // 5. Resource & Cooldown Value
+    let resScore = 0;
+    if (p.cooldowns.ability === 0) {
+      const abilityReadyVal: Record<PieceType, number> = {
+        KING: 4, QUEEN: 8, ROOK: 6, KNIGHT: 7, BISHOP: 8, PAWN: 0, ROYAL_GUARD: 0
+      };
+      const readyVal = abilityReadyVal[p.type] || 0;
+      const abilityMult = phase === 'OPENING' ? 2.0 : 1.0;
+      resScore += readyVal * abilityMult;
+    }
+
+    let resourceMult = 1.0;
+    if (phase === 'MIDDLEGAME') {
+      resourceMult = 1.5;
+    }
+
+    if (p.type === 'KING' || p.type === 'QUEEN' || p.type === 'ROOK' || p.type === 'BISHOP' || p.type === 'KNIGHT') {
+      resScore += p.valor * 1.5 * resourceMult;
+      if (p.valor === 7) {
+        resScore += 12.0;
+        if (phase === 'OPENING') resScore += 15.0;
+      }
+    } else {
+      resScore += p.resolve * 1.2 * resourceMult;
+      if (p.resolve === 5 && !p.unyieldingUsed) {
+        resScore += 15.0;
+      }
+    }
+
+    // Status effects
+    let statusMult = 1.0;
+    if (phase === 'MIDDLEGAME') {
+      statusMult = 1.5;
+    }
+
+    const isThreatened = enemyPieces.some(ep => canPieceAttackTarget(gameState.board, ep.p, ep.r, ep.c, r, c));
+    const defenseMultiplier = isThreatened ? 1.0 : 0.2;
+
+    if (p.conditions.shielded) resScore += 4.0 * statusMult * defenseMultiplier;
+    if (p.conditions.guarded > 0) resScore += p.conditions.guarded * 3.0 * statusMult * defenseMultiplier;
+    if (p.conditions.guarding) resScore += 2.0 * statusMult;
+    if (p.conditions.armored > 0) resScore += p.conditions.armored * 1.5 * statusMult * defenseMultiplier;
+    if (p.conditions.empowered > 0) resScore += p.conditions.empowered * 3.0 * statusMult;
+
+    if (p.conditions.frozen) resScore -= 8.0 * statusMult;
+    if (p.conditions.suppressed) resScore -= 6.0 * statusMult;
+    if (p.conditions.marked) resScore -= 4.0 * statusMult;
+
+    // Last turn of control actions/passive checks for Charmed piece
+    if (isCharmed && p.conditions.charmed === 1) {
+      const wasMoved = lastMove && lastMove.from.r === r && lastMove.from.c === c;
+      if (wasMoved) {
+        if (lastMove.actionType === 'ATTACK') {
+          resScore += 50.0;
+        } else if (lastMove.actionType === 'ABILITY' || lastMove.actionType === 'SUPER') {
+          resScore += 35.0;
+        } else {
+          resScore -= 15.0;
+        }
+      } else {
+        resScore -= 40.0;
+      }
+    }
+
+    resourcesSelf += resScore;
+  }
+
+  // Iterate enemy pieces
+  for (const entry of enemyPieces) {
+    const { p, r, c } = entry;
+    const baseVal = MATERIAL_VALUES[p.type];
+
+    // 1. Material value scaled by remaining HP
+    const hpRatio = p.maxHp > 0 ? p.hp / p.maxHp : 1.0;
+    const hpBaseline = phase === 'ENDGAME' ? 0.6 : 0.4;
+    let rawMaterial = baseVal * (hpBaseline + (1.0 - hpBaseline) * hpRatio);
+
+    // 2. Charmed material adjustment (Temporary control)
+    const isCharmed = p.conditions.charmed > 0;
+    if (isCharmed) {
+      if (p.conditions.charmed === 1) {
+        rawMaterial *= 0.2;
+      } else {
+        rawMaterial *= 0.6;
+      }
+    }
+
+    materialEnemy += rawMaterial;
+
+    // 3. Positional values
+    let posScore = 0;
+
+    // Central board control
+    if (r >= 2 && r <= 5 && c >= 2 && c <= 5) {
+      if (phase === 'OPENING') posScore += 3.5;
+      else if (phase === 'MIDDLEGAME') posScore += 2.0;
+      else posScore += 1.0;
+    }
+
+    // Piece coordination coverage
+    if (enemyKingPos && p.type !== 'KING') {
+      const distToKing = getDistance({ r, c }, enemyKingPos);
+      if (distToKing <= 2) {
+        posScore += 1.5;
+      }
+    }
+
+    // Pawn chains
+    if (p.type === 'PAWN') {
+      const supportRow = p.color === 'WHITE' ? r + 1 : r - 1;
+      const isSupportedLeft = c > 0 && gameState.board[supportRow]?.[c - 1]?.type === 'PAWN' && gameState.board[supportRow]?.[c - 1]?.color === p.color;
+      const isSupportedRight = c < 7 && gameState.board[supportRow]?.[c + 1]?.type === 'PAWN' && gameState.board[supportRow]?.[c + 1]?.color === p.color;
+      if (isSupportedLeft || isSupportedRight) {
+        posScore += 1.5;
+      }
+    }
+
+    // Piece-specific positional heuristics
+    let specScore = 0;
+    switch (p.type) {
+      case 'PAWN': {
+        const pawnRowProgress = p.color === 'WHITE' ? (6 - r) : (r - 1);
+        const advancementMultiplier = profile.name === 'Squire' ? 2.0 : profile.name === 'Knight' ? 4.0 : 5.5;
+        let progressBonus = pawnRowProgress * advancementMultiplier;
+        
+        let promoBonus = pawnRowProgress >= 4 ? 12.0 : 0.0;
+        if (phase === 'ENDGAME') {
+          progressBonus = pawnRowProgress * (profile.name === 'Squire' ? 5.0 : 7.5);
+          promoBonus = pawnRowProgress >= 4 ? 35.0 : 0.0;
+        }
+        specScore += progressBonus + promoBonus;
+        break;
+      }
+
+      case 'KNIGHT': {
+        const distToCenter = Math.abs(3.5 - r) + Math.abs(3.5 - c);
+        specScore += (6 - distToCenter) * 0.8;
+        break;
+      }
+
+      case 'ROYAL_GUARD':
+        if (enemyKingPos) {
+          const distToKing = getDistance({ r, c }, enemyKingPos);
+          if (distToKing <= 2) {
+            specScore += 5.0;
+          }
+        }
+        break;
+
+      case 'ROOK':
+        specScore += 1.5;
+        break;
+
+      case 'BISHOP':
+        specScore += 1.0;
+        break;
+
+      case 'QUEEN':
+        specScore += 2.0;
+        break;
+    }
+
+    if (phase === 'OPENING' && p.type !== 'PAWN' && p.type !== 'KING') {
+      specScore *= 1.5;
+    }
+    posScore += specScore;
+
+    // 4. Lightweight mobility heuristic
+    let pieceMobility = 0;
+    switch (p.type) {
+      case 'KNIGHT': {
+        const knightMoves = [[-2,-1], [-2,1], [-1,-2], [-1,2], [1,-2], [1,2], [2,-1], [2,1]];
+        for (const [dr, dc] of knightMoves) {
+          const nr = r + dr, nc = c + dc;
+          if (isValidPos(nr, nc)) {
+            const target = gameState.board[nr][nc];
+            if (!target) pieceMobility += 0.5;
+            else if (target.color !== p.color) pieceMobility += 0.8;
+          }
+        }
+        break;
+      }
+      case 'BISHOP': {
+        const dirs = [[-1,-1], [-1,1], [1,-1], [1,1]];
+        for (const [dr, dc] of dirs) {
+          for (let i = 1; i <= 3; i++) {
+            const nr = r + dr * i, nc = c + dc * i;
+            if (!isValidPos(nr, nc)) break;
+            const target = gameState.board[nr][nc];
+            if (!target) pieceMobility += 0.4;
+            else {
+              if (target.color !== p.color) pieceMobility += 0.6;
+              break;
+            }
+          }
+        }
+        break;
+      }
+      case 'ROOK': {
+        const dirs = [[-1,0], [1,0], [0,-1], [0,1]];
+        for (const [dr, dc] of dirs) {
+          for (let i = 1; i <= 3; i++) {
+            const nr = r + dr * i, nc = c + dc * i;
+            if (!isValidPos(nr, nc)) break;
+            const target = gameState.board[nr][nc];
+            if (!target) pieceMobility += 0.4;
+            else {
+              if (target.color !== p.color) pieceMobility += 0.6;
+              break;
+            }
+          }
+        }
+        break;
+      }
+      case 'QUEEN': {
+        const dirs = [[-1,-1], [-1,1], [1,-1], [1,1], [-1,0], [1,0], [0,-1], [0,1]];
+        for (const [dr, dc] of dirs) {
+          for (let i = 1; i <= 2; i++) {
+            const nr = r + dr * i, nc = c + dc * i;
+            if (!isValidPos(nr, nc)) break;
+            const target = gameState.board[nr][nc];
+            if (!target) pieceMobility += 0.4;
+            else {
+              if (target.color !== p.color) pieceMobility += 0.6;
+              break;
+            }
+          }
+        }
+        break;
+      }
+      case 'PAWN': {
+        const forward = p.color === 'WHITE' ? -1 : 1;
+        const nr = r + forward;
+        if (isValidPos(nr, c) && !gameState.board[nr][c]) pieceMobility += 0.5;
+        for (const dc of [-1, 1]) {
+          const nc = c + dc;
+          if (isValidPos(nr, nc)) {
+            const target = gameState.board[nr][nc];
+            if (target && target.color !== p.color) pieceMobility += 0.8;
+          }
+        }
+        break;
+      }
+      default: {
+        for (let dr = -1; dr <= 1; dr++) {
+          for (let dc = -1; dc <= 1; dc++) {
+            if (dr === 0 && dc === 0) continue;
+            const nr = r + dr, nc = c + dc;
+            if (isValidPos(nr, nc)) {
+              const target = gameState.board[nr][nc];
+              if (!target) pieceMobility += 0.3;
+              else if (target.color !== p.color) pieceMobility += 0.5;
+            }
+          }
+        }
+        break;
+      }
+    }
+    posScore += pieceMobility * 0.4;
+
+    positionalEnemy += posScore;
+
+    // 5. Resource & Cooldown Value
+    let resScore = 0;
+    if (p.cooldowns.ability === 0) {
+      const abilityReadyVal: Record<PieceType, number> = {
+        KING: 4, QUEEN: 8, ROOK: 6, KNIGHT: 7, BISHOP: 8, PAWN: 0, ROYAL_GUARD: 0
+      };
+      const readyVal = abilityReadyVal[p.type] || 0;
+      const abilityMult = phase === 'OPENING' ? 2.0 : 1.0;
+      resScore += readyVal * abilityMult;
+    }
+
+    let resourceMult = 1.0;
+    if (phase === 'MIDDLEGAME') {
+      resourceMult = 1.5;
+    }
+
+    if (p.type === 'KING' || p.type === 'QUEEN' || p.type === 'ROOK' || p.type === 'BISHOP' || p.type === 'KNIGHT') {
+      resScore += p.valor * 1.5 * resourceMult;
+      if (p.valor === 7) {
+        resScore += 12.0;
+        if (phase === 'OPENING') resScore += 15.0;
+      }
+    } else {
+      resScore += p.resolve * 1.2 * resourceMult;
+      if (p.resolve === 5 && !p.unyieldingUsed) {
+        resScore += 15.0;
+      }
+    }
+
+    // Status effects
+    let statusMult = 1.0;
+    if (phase === 'MIDDLEGAME') {
+      statusMult = 1.5;
+    }
+
+    const isThreatened = selfPieces.some(sp => canPieceAttackTarget(gameState.board, sp.p, sp.r, sp.c, r, c));
+    const defenseMultiplier = isThreatened ? 1.0 : 0.2;
+
+    if (p.conditions.shielded) resScore += 4.0 * statusMult * defenseMultiplier;
+    if (p.conditions.guarded > 0) resScore += p.conditions.guarded * 3.0 * statusMult * defenseMultiplier;
+    if (p.conditions.guarding) resScore += 2.0 * statusMult;
+    if (p.conditions.armored > 0) resScore += p.conditions.armored * 1.5 * statusMult * defenseMultiplier;
+    if (p.conditions.empowered > 0) resScore += p.conditions.empowered * 3.0 * statusMult;
+
+    if (p.conditions.frozen) resScore -= 8.0 * statusMult;
+    if (p.conditions.suppressed) resScore -= 6.0 * statusMult;
+    if (p.conditions.marked) resScore -= 4.0 * statusMult;
+
+    // Last turn of control actions/passive checks for Charmed piece
+    if (isCharmed && p.conditions.charmed === 1) {
+      const wasMoved = lastMove && lastMove.from.r === r && lastMove.from.c === c;
+      if (wasMoved) {
+        if (lastMove.actionType === 'ATTACK') {
+          resScore += 50.0;
+        } else if (lastMove.actionType === 'ABILITY' || lastMove.actionType === 'SUPER') {
+          resScore += 35.0;
+        } else {
+          resScore -= 15.0;
+        }
+      } else {
+        resScore -= 40.0;
+      }
+    }
+
+    resourcesEnemy += resScore;
+  }
+
+  // 4. King Safety Heuristic
+  if (selfKingPos) {
+    safetySelf = calculateKingSafetyScore(gameState, evaluatingColor, selfKingPos, phase, profile.name);
+  }
+
+  if (enemyKingPos) {
+    const enemyColor = evaluatingColor === 'WHITE' ? 'BLACK' : 'WHITE';
+    safetyEnemy = calculateKingSafetyScore(gameState, enemyColor, enemyKingPos, phase, profile.name);
+  }
+
+  // 5. Board-wide Threat-Creation Term (For spotting double-attacks or forcing moves)
+  let threatScoreSelf = 0;
+  let threatScoreEnemy = 0;
+
+  for (const sp of selfPieces) {
+    if (sp.p.type === 'KING') continue;
+    for (const ep of enemyPieces) {
+      if (ep.p.type === 'KING') continue;
+      
+      if (canPieceAttackTarget(gameState.board, sp.p, sp.r, sp.c, ep.r, ep.c)) {
+        const valSp = MATERIAL_VALUES[sp.p.type] || 0;
+        const valEp = MATERIAL_VALUES[ep.p.type] || 0;
+        
+        if (valEp > valSp) {
+          // High-value threat (e.g. Pawn attacking Queen)
+          threatScoreSelf += (valEp - valSp) * 0.12 + 2.0;
+        } else {
+          threatScoreSelf += valEp * 0.05 + 0.5;
+        }
+      }
+    }
+
+    // Ability alignment threat (Bishop/Queen ability alignments)
+    if (sp.p.cooldowns.ability === 0 && (sp.p.type === 'QUEEN' || sp.p.type === 'BISHOP')) {
+      for (const ep of enemyPieces) {
+        if (ep.p.type === 'QUEEN' || ep.p.type === 'KING' || ep.p.type === 'ROOK') {
+          const dr = ep.r - sp.r;
+          const dc = ep.c - sp.c;
+          const absDr = Math.abs(dr);
+          const absDc = Math.abs(dc);
+          if ((sp.p.type === 'BISHOP' && absDr === absDc) || (sp.p.type === 'QUEEN' && (absDr === absDc || dr === 0 || dc === 0))) {
+            threatScoreSelf += 2.5;
+          }
+        }
+      }
+    }
+  }
+
+  for (const ep of enemyPieces) {
+    if (ep.p.type === 'KING') continue;
+    for (const sp of selfPieces) {
+      if (sp.p.type === 'KING') continue;
+      
+      if (canPieceAttackTarget(gameState.board, ep.p, ep.r, ep.c, sp.r, sp.c)) {
+        const valEp = MATERIAL_VALUES[ep.p.type] || 0;
+        const valSp = MATERIAL_VALUES[sp.p.type] || 0;
+        
+        if (valSp > valEp) {
+          threatScoreEnemy += (valSp - valEp) * 0.12 + 2.0;
+        } else {
+          threatScoreEnemy += valSp * 0.05 + 0.5;
+        }
+      }
+    }
+
+    if (ep.p.cooldowns.ability === 0 && (ep.p.type === 'QUEEN' || ep.p.type === 'BISHOP')) {
+      for (const sp of selfPieces) {
+        if (sp.p.type === 'QUEEN' || sp.p.type === 'KING' || sp.p.type === 'ROOK') {
+          const dr = sp.r - ep.r;
+          const dc = sp.c - ep.c;
+          const absDr = Math.abs(dr);
+          const absDc = Math.abs(dc);
+          if ((ep.p.type === 'BISHOP' && absDr === absDc) || (ep.p.type === 'QUEEN' && (absDr === absDc || dr === 0 || dc === 0))) {
+            threatScoreEnemy += 2.5;
+          }
+        }
+      }
+    }
+  }
+
+
+  // C3: Bastion evaluation enhancements
+  for (const { p, r, c } of selfPieces) {
+    if (p.type === 'ROOK' && p.bastionTurns && p.bastionTurns > 0) {
+      let hypotheticalAttacks = 0;
+      let maxAttackVal = 0;
+      const fakeRook = { ...p, bastionTurns: 0 };
+      for (const ep of enemyPieces) {
+        if (canPieceAttackTarget(gameState.board, fakeRook, r, c, ep.r, ep.c)) {
+           hypotheticalAttacks++;
+           const val = MATERIAL_VALUES[ep.p.type] || 0;
+           if (val > maxAttackVal) maxAttackVal = val;
+        }
+      }
+      const oppCost = hypotheticalAttacks * 1.5 + maxAttackVal * 0.5;
+      threatScoreSelf += (threatScoreEnemy * 0.4) - oppCost; // Use threatScoreSelf to represent Bastion's net positional/threat value
+    }
+  }
+
+  for (const { p, r, c } of enemyPieces) {
+    if (p.type === 'ROOK' && p.bastionTurns && p.bastionTurns > 0) {
+      let hypotheticalAttacks = 0;
+      let maxAttackVal = 0;
+      const fakeRook = { ...p, bastionTurns: 0 };
+      for (const sp of selfPieces) {
+        if (canPieceAttackTarget(gameState.board, fakeRook, r, c, sp.r, sp.c)) {
+           hypotheticalAttacks++;
+           const val = MATERIAL_VALUES[sp.p.type] || 0;
+           if (val > maxAttackVal) maxAttackVal = val;
+        }
+      }
+      const oppCost = hypotheticalAttacks * 1.5 + maxAttackVal * 0.5;
+      threatScoreEnemy += (threatScoreSelf * 0.4) - oppCost;
+    }
+  }
+
+  const finalThreats = (threatScoreSelf - threatScoreEnemy) * profile.tacticalAggressiveness * 0.8;
+
+  // Apply weights from profile and scale by game phase
+  let phasePosWeight = 1.0;
+  let phaseResWeight = 1.0;
+  let phaseSafetyWeight = 1.0;
+
+  if (phase === 'OPENING') {
+    phasePosWeight = 1.6;     // Heavily weight space, development, and coordination
+    phaseSafetyWeight = 1.5;  // Keep King safe early
+    phaseResWeight = 0.8;     // Less focus on wasting ready abilities
+  } else if (phase === 'MIDDLEGAME') {
+    phasePosWeight = 1.0;
+    phaseResWeight = 1.5;     // Heavily value active combat resources & status effects
+    phaseSafetyWeight = 1.2;
+  } else if (phase === 'ENDGAME') {
+    phasePosWeight = 1.4;     // Heavy priority to Pawn promotion paths
+    phaseSafetyWeight = 2.0;  // Supreme defensive focus
+    phaseResWeight = 1.0;
+  }
+
+  const finalMaterial = materialSelf - materialEnemy;
+  const finalPositional = (positionalSelf - positionalEnemy) * profile.positionalWeight * phasePosWeight + finalThreats;
+  const finalResources = (resourcesSelf - resourcesEnemy) * profile.resourceValuation * phaseResWeight;
+  const finalKingSafety = (safetySelf - safetyEnemy) * profile.kingSafetyWeight * phaseSafetyWeight;
+
+  // Simplification Bonus for Endgame
+  let simplificationBonus = 0;
+  if (phase === 'ENDGAME') {
+    const isAhead = finalMaterial > 10;
+    if (isAhead) {
+      let totalPieces = 0;
+      for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+          if (gameState.board[r][c]) totalPieces++;
+        }
+      }
+      // Reward trading down to simplify winning endgame positions
+      simplificationBonus = (32 - totalPieces) * 2.5;
+    }
+  }
+
+  // C4 & C5 Move-specific evaluations
+  let moveSpecificBonus = 0;
+  if (lastMove && lastMove.actionType === 'ABILITY') {
+    const caster = gameState.board[lastMove.from.r][lastMove.from.c];
+    if (caster) {
+      const isSelf = caster.color === evaluatingColor;
+      const sign = isSelf ? 1 : -1;
+      
+      if (caster.type === 'BISHOP') {
+        const target = gameState.board[lastMove.to.r][lastMove.to.c];
+        if (target && target.color === caster.color) {
+          const estimatedPreHealHp = Math.max(1, target.hp - 3);
+          const missingFrac = (target.maxHp - estimatedPreHealHp) / target.maxHp;
+          moveSpecificBonus += sign * 15.0 * missingFrac;
+        }
+      } else if (caster.type === 'KING') {
+        const casterSafety = isSelf ? safetySelf : safetyEnemy;
+        const threatLevel = Math.max(0, -casterSafety);
+        moveSpecificBonus += sign * threatLevel * 0.4;
+      }
+    }
+  }
+
+  const total = finalMaterial + finalPositional + finalResources + finalKingSafety + simplificationBonus + moveSpecificBonus;
+
+  return {
+    total,
+    material: finalMaterial,
+    positional: finalPositional,
+    kingSafety: finalKingSafety,
+    resources: finalResources,
+    phase,
+  };
+}

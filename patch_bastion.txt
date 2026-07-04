@@ -1,0 +1,16 @@
+    case 'ROOK': // Bastion
+      caster.conditions.guarding = true;
+      caster.conditions.armored += 1;
+      caster.bastionTurns = 3;
+      for (let tr = 0; tr < 8; tr++) {
+        for (let tc = 0; tc < 8; tc++) {
+          const ally = nextState.board[tr][tc];
+          if (ally && ally.color === caster.color && ally.id !== caster.id) {
+            if (Math.max(Math.abs(tr - action.row), Math.abs(tc - action.col)) <= 2) {
+              ally.conditions.guarded += 2;
+            }
+          }
+        }
+      }
+      nextState.history.push(logSuper(nextState.turn, caster, "Bastion", "becoming an unbreakable iron bastion and shielding the kingdom"));
+      break;

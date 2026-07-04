@@ -1,0 +1,2004 @@
+import { useEffect, useState, useRef, useMemo } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
+import { GameState, Position, GameSetup, AIDifficulty, ScreenState, PieceType } from '../../types';
+import { createInitialGameState } from '../../lib/game/core';
+import { Tile } from './Tile';
+import { GamePiece } from './GamePiece';
+import { PieceIcon } from './PieceIcon';
+import { LeftPanel } from './LeftPanel';
+import { PieceDetailsPanel } from './PieceDetailsPanel';
+import { VictoryOverlay } from './VictoryOverlay';
+import { computeAIMove } from '../../lib/game/ai';
+import { SettingsScreen } from '../screens/SettingsScreen';
+
+// Feedback layers
+import { FloatingText, ParticleEmitter, SuperAnnouncementOverlay, LastStandAnnouncementOverlay, PromoAnnouncementOverlay, PrePromoAnnouncementOverlay } from './FeedbackLayers';
+import { audio } from '../../lib/audio';
+import { 
+  Play, 
+  Pause, 
+  RotateCcw, 
+  Flag, 
+  Settings, 
+  LogOut, 
+  Swords, 
+  Crown, 
+  Sparkles, 
+  ShieldAlert, 
+  Settings2 
+} from 'lucide-react';
+
+
+const PIECE_PROMO_RES_DETAILS: Record<PieceType, { name: string; class: string; desc: string }> = {
+  ROOK: {
+    name: 'Iron Bastion',
+    class: 'Rook / Defender',
+    desc: 'Unmatched in defense. Can protect adjacent allies, absorb incoming strikes with its passive Shield, and deploy the Bastion super to armor itself and guard the entire battlefield.'
+  },
+  KNIGHT: {
+    name: 'Grand Paladin',
+    class: 'Knight / Cavalry',
+    desc: 'A swift, agile champion. Leaps over files to engage targets directly, marks enemies for Relentless Pursuit, and can execute Lethal Pounce to instantly eliminate any non-King threat.'
+  },
+  BISHOP: {
+    name: 'High Cleric',
+    class: 'Bishop / Cleric',
+    desc: 'The divine guardian of life and judgment. Restores health to wounded allies, smites distant enemies, and channels the miracle of Resurrection to revive fallen comrades.'
+  },
+  QUEEN: {
+    name: 'Empress',
+    class: 'Queen / Monarch',
+    desc: 'The ultimate offensive power on the field. Suppresses nearby foes, charms single targets, and can unleash the Ice Palace to freeze entire lines of enemy pieces.'
+  },
+  PAWN: {
+    name: 'Soldier',
+    class: 'Pawn / Infantry',
+    desc: 'The brave backbone of the kingdom. Simple but determined, soldiers can brace to temporarily shield themselves from attacks and march forward to seek promotion.'
+  },
+  ROYAL_GUARD: {
+    name: 'Guard',
+    class: 'Royal Guard',
+    desc: 'The King’s personal shield. Positioned at the vanguard, Guards gain Shielded upon summon and form an unbreakable bulwark adjacent to their Sovereign.'
+  },
+  KING: {
+    name: 'Sovereign',
+    class: 'King / Ruler',
+    desc: 'The heart of the army. Immune to all status effects and capable of summoning Guards or seizing extra turns when under duress.'
+  }
+};
+
+const getStrictClass = (type: PieceType): string => {
+  if (type === 'KING' || type === 'QUEEN' || type === 'ROYAL_GUARD') return 'Royal';
+  if (type === 'ROOK' || type === 'KNIGHT' || type === 'BISHOP') return 'Champion';
+  return 'Infantry';
+};
+
+
+function getSuppressedAuraData(board: (any)[][]): string[][] {
+  const grid: string[][] = Array.from({ length: 8 }, () => Array(8).fill(''));
+  const queenPositions: { r: number; c: number; color: string }[] = [];
+
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const piece = board[r][c];
+      if (piece && piece.type === 'QUEEN' && piece.conditions.charmed === 0) {
+        queenPositions.push({ r, c, color: piece.color });
+      }
+    }
+  }
+
+  const dirs = [
+    [-1, -1], [-1, 0], [-1, 1],
+    [0, -1],           [0, 1],
+    [1, -1],  [1, 0],  [1, 1]
+  ];
+
+  for (const q of queenPositions) {
+    let hasAdjacentSuppressibleEnemy = false;
+    for (const [dr, dc] of dirs) {
+      const nr = q.r + dr;
+      const nc = q.c + dc;
+      if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+        const adjacentPiece = board[nr][nc];
+        if (adjacentPiece && adjacentPiece.color !== q.color) {
+          if (adjacentPiece.type !== 'KING' && adjacentPiece.type !== 'QUEEN' && adjacentPiece.type !== 'ROYAL_GUARD') {
+            hasAdjacentSuppressibleEnemy = true;
+            break;
+          }
+        }
+      }
+    }
+    
+    if (hasAdjacentSuppressibleEnemy) {
+      for (const [dr, dc] of dirs) {
+        const nr = q.r + dr;
+        const nc = q.c + dc;
+        if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+          const current = grid[nr][nc];
+          if (current === '') {
+            grid[nr][nc] = q.color;
+          } else if (current !== q.color) {
+            grid[nr][nc] = 'BOTH';
+          }
+        }
+      }
+    }
+  }
+
+  return grid;
+}
+
+function getBastionAuraData(board: (any)[][]): string[][] {
+  const grid: string[][] = Array.from({ length: 8 }, () => Array(8).fill(''));
+  const rookPositions: { r: number; c: number; color: string }[] = [];
+
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const piece = board[r][c];
+      if (piece && piece.type === 'ROOK' && piece.bastionTurns !== undefined && piece.bastionTurns > 0) {
+        rookPositions.push({ r, c, color: piece.color });
+      }
+    }
+  }
+
+  for (const rook of rookPositions) {
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        if (Math.abs(r - rook.r) <= 2 && Math.abs(c - rook.c) <= 2) {
+          const current = grid[r][c];
+          if (current === '') {
+            grid[r][c] = rook.color;
+          } else if (current !== rook.color) {
+            grid[r][c] = 'BOTH';
+          }
+        }
+      }
+    }
+  }
+
+  return grid;
+}
+
+
+interface BoardProps {
+  setup: GameSetup | null;
+  setScreen: (screen: ScreenState) => void;
+}
+
+export function Board({ setup, setScreen }: BoardProps) {
+  // Underlying game state
+  const [gameState, rawSetGameState] = useState<GameState | null>(null);
+  const [isPaused, setIsPaused] = useState(false);
+  const [displayBottomColor, setDisplayBottomColor] = useState<'WHITE' | 'BLACK'>(setup?.bottomColor || 'WHITE');
+
+  const suppressedAuraGrid = useMemo(() => {
+    if (!gameState) return Array.from({ length: 8 }, () => Array(8).fill(''));
+    return getSuppressedAuraData(gameState.board);
+  }, [gameState]);
+
+  const bastionAuraGrid = useMemo(() => {
+    if (!gameState) return Array.from({ length: 8 }, () => Array(8).fill(''));
+    return getBastionAuraData(gameState.board);
+  }, [gameState]);
+  
+  // Custom Visual Effects and Presentation State
+  const [floatingTexts, setFloatingTexts] = useState<{ id: string; r: number; c: number; text: string; type: 'damage' | 'heal' | 'buff' | 'debuff' | 'passive' | 'super' | 'valor' | 'resolve' }[]>([]);
+  const [particles, setParticles] = useState<{ id: string; r: number; c: number; type: 'heal' | 'spark' | 'shatter' | 'magic' | 'slash' | 'ice' | 'super_holy' | 'super_bastion' | 'super_ice' | 'super_command' | 'ice_break' }[]>([]);
+  const [shake, setShake] = useState<'none' | 'small' | 'medium' | 'large'>('none');
+  const [activeLunge, setActiveLunge] = useState<{ from: Position; to: Position; id: string } | null>(null);
+  const [activeFlinch, setActiveFlinch] = useState<{ r: number; c: number; id: string } | null>(null);
+  const [dyingPiece, setDyingPiece] = useState<{ r: number; c: number; piece: any } | null>(null);
+  const [jumpingPieces, setJumpingPieces] = useState<Record<string, boolean>>({});
+  const [superAnnouncement, setSuperAnnouncement] = useState<{ name: string; type: string } | null>(null);
+  const [lastStandAnnouncement, setLastStandAnnouncement] = useState<boolean>(false);
+  const [promoAnnouncement, setPromoAnnouncement] = useState<{ name: string } | null>(null);
+  const [revivalChoice, setRevivalChoice] = useState<{ from: Position; to: Position; deadAllies: PieceType[] } | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [isReviewingMatch, setIsReviewingMatch] = useState(false);
+
+  // Pre-promotion cinematic and warp animation states
+  const [prePromoAnnouncementActive, setPrePromoAnnouncementActive] = useState(false);
+  const [warpPromoSquare, setWarpPromoSquare] = useState<{ r: number; c: number } | null>(null);
+  const lastAnnouncedPromoRef = useRef<string | null>(null);
+
+  const [flyingSpikes, setFlyingSpikes] = useState<{ id: string; from: Position; to: Position }[]>([]);
+  const [pulsatingGuardians, setPulsatingGuardians] = useState<Record<string, boolean>>({});
+  const [pulsatingGuarded, setPulsatingGuarded] = useState<Record<string, boolean>>({});
+
+  const guardingAuras = useMemo(() => {
+    const map: Record<string, boolean> = {};
+    if (!gameState) return map;
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const p = gameState.board[r][c];
+        if (p && p.conditions.guarding) {
+          map[`${r}_${c}`] = true;
+        }
+      }
+    }
+    return map;
+  }, [gameState]);
+
+  const guardedAuras = useMemo(() => {
+    const map: Record<string, { gr: number; gc: number; hideSpike: boolean }> = {};
+    if (!gameState) return map;
+    
+    // Find all active guardians on the board
+    const guardians: { r: number; c: number; id: string; color: string; type: string; protectedPieceId?: string; bastionTurns?: number }[] = [];
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const p = gameState.board[r][c];
+        if (p && p.conditions.guarding) {
+          guardians.push({
+            r,
+            c,
+            id: p.id,
+            color: p.color,
+            type: p.type,
+            protectedPieceId: p.protectedPieceId,
+            bastionTurns: p.bastionTurns
+          });
+        }
+      }
+    }
+
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const p = gameState.board[r][c];
+        if (!p) continue;
+        
+        const isKingWithRG = p.type === 'KING' && guardians.some(g => g.type === 'ROYAL_GUARD' && g.color === p.color && Math.abs(r - g.r) <= 1 && Math.abs(c - g.c) <= 1);
+        if (p.conditions.guarded > 0 || p.conditions.bastionGuarded || isKingWithRG) {
+          // Find which guardian is guarding this piece
+          for (const g of guardians) {
+            if (g.color === p.color && g.id !== p.id) {
+              if (g.type === 'ROOK') {
+                const inBastion = g.bastionTurns !== undefined && g.bastionTurns > 0;
+                if (g.protectedPieceId === p.id) {
+                  map[`${r}_${c}`] = { gr: g.r, gc: g.c, hideSpike: inBastion };
+                  break;
+                } else if (inBastion) {
+                  if (Math.abs(r - g.r) <= 2 && Math.abs(c - g.c) <= 2) {
+                    map[`${r}_${c}`] = { gr: g.r, gc: g.c, hideSpike: true };
+                    break;
+                  }
+                }
+              } else if (g.type === 'ROYAL_GUARD') {
+                if (p.type === 'KING' && Math.abs(r - g.r) <= 1 && Math.abs(c - g.c) <= 1) {
+                  map[`${r}_${c}`] = { gr: g.r, gc: g.c, hideSpike: false };
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    return map;
+  }, [gameState]);
+
+  // Helper functions to spawn visual feedback elements
+  const spawnFloatingText = (r: number, c: number, text: string, type: any) => {
+    if ((localStorage.getItem('combatText') || 'true') === 'false') return;
+    setFloatingTexts(prev => [...prev, { id: Math.random().toString(), r, c, text, type }]);
+  };
+
+  const removeFloatingText = (id: string) => {
+    setFloatingTexts(prev => prev.filter(t => t.id !== id));
+  };
+
+  const spawnParticles = (r: number, c: number, type: any) => {
+    const density = parseFloat(localStorage.getItem('particleDensity') || '1.0');
+    if (density === 0) return;
+    setParticles(prev => [...prev, { id: Math.random().toString(), r, c, type }]);
+  };
+
+  const removeParticle = (id: string) => {
+    setParticles(prev => prev.filter(p => p.id !== id));
+  };
+
+  const triggerShake = (level: 'small' | 'medium' | 'large') => {
+    const intensity = parseFloat(localStorage.getItem('screenShake') || '1.0');
+    if (intensity === 0) return;
+    setShake(level);
+    const durations = { small: 250, medium: 350, large: 550 };
+    setTimeout(() => setShake('none'), durations[level]);
+  };
+
+  const triggerPieceJump = (pieceId: string) => {
+    setJumpingPieces(prev => ({ ...prev, [pieceId]: true }));
+    setTimeout(() => {
+      setJumpingPieces(prev => {
+        const copy = { ...prev };
+        delete copy[pieceId];
+        return copy;
+      });
+    }, 450);
+  };
+
+  // --- AUTOMATED STATE TRANSITION FEEDBACK ENGINE ---
+  const updateStateWithVFX = (nextStateOrUpdater: GameState | ((prev: GameState | null) => GameState | null)) => {
+    rawSetGameState(prev => {
+      const nextState = typeof nextStateOrUpdater === 'function' 
+        ? nextStateOrUpdater(prev) 
+        : nextStateOrUpdater;
+
+      if (!nextState || !prev) return nextState;
+
+      const baseAnimSpeed = parseFloat(localStorage.getItem('animationSpeed') || '1.0');
+      const speedMultiplier = (setup?.mode === 'WAR_TABLE' && nextState.simulationSpeed) ? nextState.simulationSpeed : 1;
+      const animSpeed = baseAnimSpeed / speedMultiplier;
+
+      let hasMove = false;
+      let hasAttack = false;
+      let hasHeal = false;
+      let hasDamage = false;
+      let hasDeath = false;
+      let hasShieldGain = false;
+      let hasShieldLoss = false;
+      let hasSuper = false;
+      let hasPromotion = false;
+      let hasConditionChange = false;
+
+      const effectsToSpawn: (() => void)[] = [];
+
+      const currentHistoryLen = prev.history.length;
+      const newHistoryLen = nextState.history.length;
+      let sName = '';
+      let sCasterType = '';
+
+      // Check history for newly declared Supers
+      if (newHistoryLen > currentHistoryLen) {
+        for (let i = currentHistoryLen; i < newHistoryLen; i++) {
+          const log = nextState.history[i];
+          if (log.includes('<SUPER>')) {
+            if (log.includes('Last Stand')) {
+              // Last Stand has its own custom overlay and logic triggered via piece state differences.
+              // Skipping standard Super activation.
+              continue;
+            }
+            hasSuper = true;
+            if (log.includes('Ice Palace')) { sName = 'Ice Palace'; sCasterType = 'QUEEN'; }
+            else if (log.includes('Command')) { sName = "King's Command"; sCasterType = 'KING'; }
+            else if (log.includes('Resurrection')) { sName = 'Resurrection'; sCasterType = 'BISHOP'; }
+            else { sName = 'Bastion'; sCasterType = 'ROOK'; }
+          }
+        }
+      }
+
+      if (sName === 'Bastion') {
+        // Bastion spikes removed based on request
+      }
+
+      // Map pieces to scan attribute differences
+      const oldPiecesMap = new Map<string, { r: number; c: number; piece: any }>();
+      const newPiecesMap = new Map<string, { r: number; c: number; piece: any }>();
+
+      for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+          const p = prev.board[r][c];
+          if (p) oldPiecesMap.set(p.id, { r, c, piece: p });
+          const np = nextState.board[r][c];
+          if (np) newPiecesMap.set(np.id, { r, c, piece: np });
+        }
+      }
+
+      // --- STATISTICAL TRACKING FOR VICTORY/DEFEAT CHRONICLE ---
+      if (!nextState.matchStats) {
+        nextState.matchStats = prev.matchStats 
+          ? JSON.parse(JSON.stringify(prev.matchStats))
+          : {
+              WHITE: { defeated: 0, damageDealt: 0, damageTaken: 0, damagePrevented: 0, healing: 0, valorEarned: 0, resolveEarned: 0, promotions: 0, supersUsed: 0 },
+              BLACK: { defeated: 0, damageDealt: 0, damageTaken: 0, damagePrevented: 0, healing: 0, valorEarned: 0, resolveEarned: 0, promotions: 0, supersUsed: 0 }
+            };
+      }
+      if (!nextState.piecePerformances) {
+        nextState.piecePerformances = prev.piecePerformances
+          ? JSON.parse(JSON.stringify(prev.piecePerformances))
+          : {};
+      }
+
+      const getPerf = (color: 'WHITE' | 'BLACK', type: any) => {
+        const key = `${color}_${type}`;
+        if (!nextState.piecePerformances![key]) {
+          nextState.piecePerformances![key] = {
+            type,
+            color,
+            damageDealt: 0,
+            damagePrevented: 0,
+            healing: 0,
+            kills: 0,
+            supersUsed: 0,
+            score: 0
+          };
+        }
+        return nextState.piecePerformances![key];
+      };
+
+      let activePieceKey: string | null = null;
+      if (prev.selectedPosition) {
+        const p = prev.board[prev.selectedPosition.r][prev.selectedPosition.c];
+        if (p) {
+          activePieceKey = `${p.color}_${p.type}`;
+        }
+      }
+
+      oldPiecesMap.forEach((oldData, id) => {
+        const newData = newPiecesMap.get(id);
+        const col = oldData.piece.color;
+        const ty = oldData.piece.type;
+
+        if (!newData) {
+          const victimColor = col;
+          const killerColor = victimColor === 'WHITE' ? 'BLACK' : 'WHITE';
+          nextState.matchStats![killerColor].defeated += 1;
+
+          // Add damage dealt and damage taken when a piece is defeated
+          const dmg = oldData.piece.hp;
+          nextState.matchStats![killerColor].damageDealt += dmg;
+          nextState.matchStats![victimColor].damageTaken += dmg;
+
+          if (activePieceKey && activePieceKey.startsWith(killerColor)) {
+            const activePieceType = activePieceKey.split('_')[1];
+            getPerf(killerColor, activePieceType).kills += 1;
+            getPerf(killerColor, activePieceType).damageDealt += dmg;
+          } else {
+            getPerf(killerColor, 'QUEEN').kills += 1;
+            getPerf(killerColor, 'QUEEN').damageDealt += dmg;
+          }
+        } else {
+          const hpDiff = newData.piece.hp - oldData.piece.hp;
+          if (hpDiff < 0) {
+            const dmg = Math.abs(hpDiff);
+            const victimColor = col;
+            const killerColor = victimColor === 'WHITE' ? 'BLACK' : 'WHITE';
+            nextState.matchStats![killerColor].damageDealt += dmg;
+            nextState.matchStats![victimColor].damageTaken += dmg;
+
+            if (activePieceKey && activePieceKey.startsWith(killerColor)) {
+              const activePieceType = activePieceKey.split('_')[1];
+              getPerf(killerColor, activePieceType).damageDealt += dmg;
+            } else {
+              getPerf(killerColor, 'QUEEN').damageDealt += dmg;
+            }
+          } else if (hpDiff > 0) {
+            nextState.matchStats![col].healing += hpDiff;
+            
+            if (activePieceKey && activePieceKey.startsWith(col)) {
+              const activePieceType = activePieceKey.split('_')[1];
+              getPerf(col, activePieceType).healing += hpDiff;
+            } else {
+              getPerf(col, 'BISHOP').healing += hpDiff;
+            }
+          }
+
+          let prevented = 0;
+          if (oldData.piece.conditions.shielded && !newData.piece.conditions.shielded) {
+            prevented += 4;
+          }
+          if (oldData.piece.conditions.armored > 0 && hpDiff < 0) {
+            prevented += oldData.piece.conditions.armored;
+          }
+          if (oldData.piece.conditions.guarded > 0 && hpDiff < 0) {
+            prevented += oldData.piece.conditions.guarded;
+          }
+
+          if (prevented > 0) {
+            nextState.matchStats![col].damagePrevented += prevented;
+            getPerf(col, ty).damagePrevented += prevented;
+          }
+
+          if (newData.piece.valor > oldData.piece.valor) {
+            const valDiff = newData.piece.valor - oldData.piece.valor;
+            nextState.matchStats![col].valorEarned += valDiff;
+          }
+
+          if (newData.piece.resolve > oldData.piece.resolve) {
+            const resDiff = newData.piece.resolve - oldData.piece.resolve;
+            nextState.matchStats![col].resolveEarned += resDiff;
+          }
+
+          if (newData.piece.valor < oldData.piece.valor && oldData.piece.valor >= 7) {
+            nextState.matchStats![col].supersUsed += 1;
+            getPerf(col, ty).supersUsed += 1;
+          }
+
+          if (oldData.piece.type === 'PAWN' && newData.piece.type !== 'PAWN') {
+            nextState.matchStats![col].promotions += 1;
+          }
+        }
+      });
+
+      Object.keys(nextState.piecePerformances!).forEach(key => {
+        const perf = nextState.piecePerformances![key];
+        perf.score = (perf.damageDealt * 1) + (perf.healing * 1.5) + (perf.damagePrevented * 1.2) + (perf.kills * 3.5) + (perf.supersUsed * 4);
+      });
+
+      // Identify jumping pieces based on newly added logs (skills, passives, attacks)
+      if (newHistoryLen > currentHistoryLen) {
+        const nameToType: Record<string, string> = {
+          'King': 'KING',
+          'Empress': 'QUEEN',
+          'Iron Bastion': 'ROOK',
+          'Grand Paladin': 'KNIGHT',
+          'High Cleric': 'BISHOP',
+          'Soldier': 'PAWN',
+          'Guard': 'ROYAL_GUARD'
+        };
+
+        for (let i = currentHistoryLen; i < newHistoryLen; i++) {
+          const log = nextState.history[i];
+          const isSkillOrPassive = log.includes('<A>') && log.includes('</A>');
+          const isAttack = log.includes('<P>enemy ');
+
+          if (isSkillOrPassive || isAttack) {
+            // Check if this log represents a defensive passive, passive healing, or shield restoration, or expired states
+            const matchA = log.match(/<A>([^<]+)<\/A>/);
+            const skillName = matchA ? matchA[1].trim() : '';
+            const EXCLUDE_JUMP_PASSIVES = [
+              "Survivor's Resolve",
+              "Undying King",
+              "Last Stand",
+              "Guardian's Burden",
+              "Divine Grace",
+              "Iron shell",
+              "Divine Blessing",
+              "Unyielding"
+            ];
+            const isDefensive = EXCLUDE_JUMP_PASSIVES.some(p => skillName.includes(p)) || 
+                                log.includes('expired') || 
+                                log.includes('restored') ||
+                                log.includes('gained 1 Resolve') ||
+                                log.includes('gained 1 Valor');
+
+            if (isDefensive) {
+              continue;
+            }
+
+            // Find the piece name in the first <P>...</P> tag
+            const matchP = log.match(/<P>([^<]+)<\/P>/);
+            if (matchP) {
+              const rawName = matchP[1].replace(/'s$/, "").trim();
+              const type = nameToType[rawName];
+              if (type) {
+                // Now find the piece of this type in nextState.board.
+                let targetPieceId: string | null = null;
+
+                // Helper to check if log is likely a passive trigger (contains "'s" or "from" or "triggered")
+                const isPassiveLog = (text: string) => {
+                  return text.includes("'s</P>") || text.includes("from <A>") || text.includes("triggered");
+                };
+
+                // 1. If it was human player who did it and prev.selectedPosition is set
+                if (prev.selectedPosition && !isPassiveLog(log)) {
+                  const selPiece = prev.board[prev.selectedPosition.r][prev.selectedPosition.c];
+                  if (selPiece && selPiece.type === type) {
+                    targetPieceId = selPiece.id;
+                  }
+                }
+
+                // 2. If not found, find piece of this type on board that had changes
+                if (!targetPieceId) {
+                  let bestMatch: string | null = null;
+                  let backupMatch: string | null = null;
+
+                  for (let nr = 0; nr < 8; nr++) {
+                    for (let nc = 0; nc < 8; nc++) {
+                      const np = nextState.board[nr][nc];
+                      if (np && np.type === type) {
+                        const opData = oldPiecesMap.get(np.id);
+                        if (opData) {
+                          const op = opData.piece;
+                          const hpChanged = np.hp !== op.hp;
+                          const cooldownChanged = np.cooldowns.ability !== op.cooldowns.ability || np.cooldowns.passive !== op.cooldowns.passive;
+                          const statsChanged = np.valor !== op.valor || np.resolve !== op.resolve;
+                          const posChanged = opData.r !== nr || opData.c !== nc;
+                          
+                          if (hpChanged || cooldownChanged || statsChanged || posChanged) {
+                            bestMatch = np.id;
+                          }
+                        }
+                        if (!backupMatch) {
+                          backupMatch = np.id;
+                        }
+                      }
+                    }
+                  }
+                  targetPieceId = bestMatch || backupMatch;
+                }
+
+                if (targetPieceId) {
+                  effectsToSpawn.push(() => {
+                    triggerPieceJump(targetPieceId!);
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+
+      oldPiecesMap.forEach((oldData, id) => {
+        const newData = newPiecesMap.get(id);
+        if (!newData) {
+          // Death detection
+          hasDeath = true;
+          effectsToSpawn.push(() => {
+            audio.playDeath();
+            spawnParticles(oldData.r, oldData.c, 'shatter');
+            spawnFloatingText(oldData.r, oldData.c, 'DEFEATED', 'debuff');
+            
+            // Trigger active flinch and preserve piece for visual animations
+            setDyingPiece({ r: oldData.r, c: oldData.c, piece: oldData.piece });
+            setActiveFlinch({ r: oldData.r, c: oldData.c, id: Math.random().toString() });
+            setTimeout(() => {
+              setDyingPiece(null);
+              setActiveFlinch(null);
+            }, 250);
+          });
+        } else {
+          // Position change check (Movement or Attack)
+          if (oldData.r !== newData.r || oldData.c !== newData.c) {
+            const lastLog = nextState.history[newHistoryLen - 1] || '';
+            const wasAttack = lastLog.includes('struck') ||
+                              lastLog.includes('struck down') ||
+                              lastLog.includes('slashed') ||
+                              lastLog.includes('crushed') ||
+                              lastLog.includes('judgment') ||
+                              lastLog.includes('smote') ||
+                              lastLog.includes('punished') ||
+                              lastLog.includes('battered') ||
+                              lastLog.includes('pierced') ||
+                              lastLog.includes('trampled') ||
+                              lastLog.includes('cleansed') ||
+                              lastLog.includes('banished') ||
+                              lastLog.includes('eliminated');
+
+            if (wasAttack) {
+              hasAttack = true;
+              effectsToSpawn.push(() => {
+                triggerPieceJump(oldData.piece.id);
+                setActiveLunge({ from: { r: oldData.r, c: oldData.c }, to: { r: newData.r, c: newData.c }, id: Math.random().toString() });
+                audio.playAttack(oldData.piece.type);
+                setTimeout(() => {
+                  audio.playHit(oldData.piece.type === 'ROOK' || oldData.piece.type === 'QUEEN');
+                }, 150 * animSpeed);
+              });
+            } else {
+              hasMove = true;
+              effectsToSpawn.push(() => {
+                audio.playMove(oldData.piece.type);
+                spawnParticles(newData.r, newData.c, 'spark');
+              });
+            }
+          }
+
+           // Health differences
+          const hpDiff = newData.piece.hp - oldData.piece.hp;
+          if (hpDiff < 0) {
+            hasDamage = true;
+            
+            // Check if this damaged piece has a guarding Rook
+            const pColor = newData.piece.color;
+            let grPos: Position | null = null;
+                       // Search board for active guarding Rook in the old state (in case it just died)
+            for (let tr = 0; tr < 8; tr++) {
+              for (let tc = 0; tc < 8; tc++) {
+                const p = gameState.board[tr][tc]; // check state BEFORE move
+                if (p && p.color === pColor && p.type === 'ROOK') {
+                  if (p.bastionTurns !== undefined && p.bastionTurns > 0) {
+                    if (Math.abs(oldData.r - tr) <= 2 && Math.abs(oldData.c - tc) <= 2) {
+                      grPos = { r: tr, c: tc };
+                      break;
+                    }
+                  } else if (p.protectedPieceId === oldData.piece.id) {
+                    grPos = { r: tr, c: tc };
+                    break;
+                  }
+                }
+              }
+              if (grPos) break;
+            }
+            if (grPos) {
+              const toPos = grPos;
+              const guardedPos = { r: oldData.r, c: oldData.c };
+              effectsToSpawn.push(() => {
+                setPulsatingGuardians(prev => ({ ...prev, [`${toPos.r}_${toPos.c}`]: true }));
+                setPulsatingGuarded(prev => ({ ...prev, [`${guardedPos.r}_${guardedPos.c}`]: true }));
+                setTimeout(() => {
+                  setPulsatingGuardians(prev => ({ ...prev, [`${toPos.r}_${toPos.c}`]: false }));
+                  setPulsatingGuarded(prev => ({ ...prev, [`${guardedPos.r}_${guardedPos.c}`]: false }));
+                }, 800);
+              });
+            }
+
+            effectsToSpawn.push(() => {
+              const dmg = Math.abs(hpDiff);
+              spawnFloatingText(newData.r, newData.c, `-${dmg} HP`, 'damage');
+              spawnParticles(newData.r, newData.c, 'slash');
+              triggerShake(dmg >= 4 ? 'medium' : 'small');
+              
+              // Trigger active flinch on the damaged piece
+              setActiveFlinch({ r: newData.r, c: newData.c, id: Math.random().toString() });
+              setTimeout(() => {
+                setActiveFlinch(null);
+              }, 250);
+            });
+          } else if (hpDiff > 0) {
+            hasHeal = true;
+            effectsToSpawn.push(() => {
+              const heal = hpDiff;
+              spawnFloatingText(newData.r, newData.c, `+${heal} HP`, 'heal');
+              spawnParticles(newData.r, newData.c, 'heal');
+              audio.playHeal();
+            });
+          }
+
+          // Condition overlays checking
+          const oldCond = oldData.piece.conditions;
+          const newCond = newData.piece.conditions;
+
+          if (!oldCond.shielded && newCond.shielded) {
+            hasShieldGain = true;
+            effectsToSpawn.push(() => {
+              spawnFloatingText(newData.r, newData.c, 'SHIELDED', 'buff');
+              audio.playShieldApply();
+            });
+          } else if (oldCond.shielded && !newCond.shielded) {
+            hasShieldLoss = true;
+            effectsToSpawn.push(() => {
+              spawnFloatingText(newData.r, newData.c, 'SHATTERED', 'debuff');
+              spawnParticles(newData.r, newData.c, 'shatter');
+              audio.playShieldShatter();
+              triggerShake('small');
+            });
+          }
+
+          if (oldCond.frozen === 0 && newCond.frozen > 0) {
+            hasConditionChange = true;
+            effectsToSpawn.push(() => {
+              spawnFloatingText(newData.r, newData.c, 'FROZEN', 'debuff');
+              spawnParticles(newData.r, newData.c, 'ice');
+              audio.playDebuff('frozen');
+            });
+          }
+
+          if (oldCond.frozen > 0 && newCond.frozen === 0) {
+            hasConditionChange = true;
+            effectsToSpawn.push(() => {
+              spawnFloatingText(newData.r, newData.c, 'THAWED', 'buff');
+              spawnParticles(newData.r, newData.c, 'ice_break');
+              audio.playIceShatter();
+            });
+          }
+
+          if (oldCond.charmed === 0 && newCond.charmed > 0) {
+            hasConditionChange = true;
+            effectsToSpawn.push(() => {
+              spawnFloatingText(newData.r, newData.c, 'CHARMED', 'debuff');
+              audio.playDebuff('charmed');
+            });
+          }
+
+          if (!oldCond.marked && newCond.marked) {
+            hasConditionChange = true;
+            effectsToSpawn.push(() => {
+              spawnFloatingText(newData.r, newData.c, 'MARKED', 'debuff');
+              audio.playDebuff('marked');
+            });
+          }
+
+          if (!oldCond.suppressed && newCond.suppressed) {
+            hasConditionChange = true;
+            effectsToSpawn.push(() => {
+              spawnFloatingText(newData.r, newData.c, 'SUPPRESSED', 'debuff');
+              audio.playDebuff('suppressed');
+            });
+          }
+
+          if (newData.piece.valor > oldData.piece.valor) {
+            effectsToSpawn.push(() => {
+              const vDiff = newData.piece.valor - oldData.piece.valor;
+              spawnFloatingText(newData.r, newData.c, `+${vDiff} VALOR`, 'valor');
+              audio.playReady('ability');
+            });
+          }
+
+          if (newData.piece.resolve > oldData.piece.resolve) {
+            effectsToSpawn.push(() => {
+              const rDiff = newData.piece.resolve - oldData.piece.resolve;
+              spawnFloatingText(newData.r, newData.c, `+${rDiff} RESOLVE`, 'resolve');
+              audio.playReady('ability');
+              
+              // Spawning stat indicators sequentially with slight offsets
+              for (let res = oldData.piece.resolve + 1; res <= newData.piece.resolve; res++) {
+                if (res === 2) {
+                  setTimeout(() => {
+                    spawnFloatingText(newData.r, newData.c, '+1 ATK', 'buff');
+                  }, 400);
+                } else if (res === 3) {
+                  setTimeout(() => {
+                    spawnFloatingText(newData.r, newData.c, '+1 MAX HP', 'buff');
+                  }, 400);
+                } else if (res === 4) {
+                  setTimeout(() => {
+                    spawnFloatingText(newData.r, newData.c, '+1 ATK', 'buff');
+                  }, 400);
+                } else if (res === 5) {
+                  setTimeout(() => {
+                    spawnFloatingText(newData.r, newData.c, 'UNYIELDING UNLOCKED', 'super');
+                  }, 400);
+                }
+              }
+            });
+          }
+
+          // Unyielding and Last Stand Triggers
+          if (!oldData.piece.unyieldingUsed && newData.piece.unyieldingUsed) {
+            effectsToSpawn.push(() => {
+              if (newData.piece.type === 'KING') {
+                spawnFloatingText(newData.r, newData.c, 'LAST STAND!', 'super');
+                setLastStandAnnouncement(true);
+                setTimeout(() => setLastStandAnnouncement(false), 2800);
+              } else {
+                spawnFloatingText(newData.r, newData.c, 'UNYIELDING!', 'super');
+              }
+            });
+          }
+
+          // Stat buffs: Armored, Guarded, Empowered (Flat changes)
+          if (newCond.empowered > oldCond.empowered) {
+            effectsToSpawn.push(() => {
+              const empDiff = newCond.empowered - oldCond.empowered;
+              spawnFloatingText(newData.r, newData.c, `+${empDiff} ATK`, 'buff');
+            });
+          } else if (newCond.empowered < oldCond.empowered) {
+            effectsToSpawn.push(() => {
+              const empDiff = oldCond.empowered - newCond.empowered;
+              spawnFloatingText(newData.r, newData.c, `-${empDiff} ATK`, 'debuff');
+            });
+          }
+
+          if (newCond.armored > oldCond.armored) {
+            effectsToSpawn.push(() => {
+              const armDiff = newCond.armored - oldCond.armored;
+              spawnFloatingText(newData.r, newData.c, `+${armDiff} ARMORED`, 'buff');
+            });
+          }
+
+          if (newCond.guarded > oldCond.guarded) {
+            effectsToSpawn.push(() => {
+              const grdDiff = newCond.guarded - oldCond.guarded;
+              spawnFloatingText(newData.r, newData.c, `+${grdDiff} GUARDED`, 'buff');
+            });
+          }
+
+          if (oldData.piece.type === 'PAWN' && newData.piece.type !== 'PAWN') {
+            hasPromotion = true;
+            effectsToSpawn.push(() => {
+              audio.playPromotion();
+              spawnFloatingText(newData.r, newData.c, 'PROMOTED!', 'super');
+              spawnParticles(newData.r, newData.c, 'super_holy');
+              setPromoAnnouncement({ name: newData.piece.type === 'ROOK' ? 'Iron Bastion' : newData.piece.type === 'KNIGHT' ? 'Grand Paladin' : 'High Cleric' });
+              setTimeout(() => setPromoAnnouncement(null), 2300);
+            });
+          }
+        }
+      });
+
+      // Redirect damage death checking (guarding pieces)
+      const oldGraveCount = (prev.graveyard?.WHITE?.length || 0) + (prev.graveyard?.BLACK?.length || 0);
+      const newGraveCount = (nextState.graveyard?.WHITE?.length || 0) + (nextState.graveyard?.BLACK?.length || 0);
+      if (newGraveCount > oldGraveCount && !hasDeath) {
+        hasDeath = true;
+        effectsToSpawn.push(() => {
+          audio.playDeath();
+        });
+      }
+
+      // Supers activated
+      if (hasSuper) {
+        effectsToSpawn.push(() => {
+          audio.playSuper(sCasterType);
+          triggerShake('large');
+          
+          for (let r = 0; r < 8; r++) {
+            for (let c = 0; c < 8; c++) {
+              const p = nextState.board[r][c];
+              if (p && p.type === sCasterType && p.color === prev.activeColor) {
+                spawnParticles(r, c, sCasterType === 'QUEEN' ? 'super_ice' : sCasterType === 'ROOK' ? 'super_bastion' : sCasterType === 'BISHOP' ? 'super_holy' : 'super_command');
+                spawnFloatingText(r, c, `${sName.toUpperCase()}!`, 'super');
+              }
+            }
+          }
+
+          setSuperAnnouncement({ name: sName, type: sCasterType });
+          setTimeout(() => setSuperAnnouncement(null), 2800);
+        });
+      }
+
+      // Turn start sound
+      if (prev.activeColor !== nextState.activeColor && !hasSuper && !hasAttack && !hasMove) {
+        effectsToSpawn.push(() => {
+          audio.playTurnStart(nextState.activeColor);
+        });
+      }
+
+      // Victory / Defeat fanfares
+      if (!prev.winner && nextState.winner) {
+        effectsToSpawn.push(() => {
+          if (nextState.winner === setup?.bottomColor) {
+            audio.playVictory();
+          } else {
+            audio.playDefeat();
+          }
+        });
+      }
+
+      // Execute all VFX triggers
+      effectsToSpawn.forEach(f => f());
+
+      return nextState;
+    });
+  };
+
+  // Assign setGameState to wrap updates automatically
+  const setGameState = updateStateWithVFX;
+
+  const handleRevivalSelection = (pieceType: PieceType) => {
+    if (!revivalChoice) return;
+    const { from, to } = revivalChoice;
+    setRevivalChoice(null);
+    import('../../lib/game/engine').then(({ executeSuper }) => {
+      setGameState(executeSuper(gameState!, from, to, pieceType));
+    });
+  };
+
+  const handlePromotionChoice = (type: 'ROOK' | 'KNIGHT' | 'BISHOP') => {
+    if (!gameState || !gameState.pendingPromotion) return;
+    const { r, c } = gameState.pendingPromotion;
+    
+    setWarpPromoSquare({ r, c });
+    spawnParticles(r, c, 'super_holy');
+    spawnFloatingText(r, c, 'ASCENDING...', 'super');
+    audio.playPromotion();
+    
+    setTimeout(() => {
+      import('../../lib/game/engine').then(({ resolvePendingPromotion }) => {
+        setGameState(resolvePendingPromotion(gameState, type));
+        setWarpPromoSquare(null);
+      });
+    }, 550);
+  };
+
+  const handleRestart = () => {
+    if (!gameState || !setup) return;
+    
+    // Clear the board immediately with rawSetGameState to skip VFX and just vanish pieces
+    const emptyState = { ...gameState, board: Array.from({ length: 8 }, () => Array(8).fill(null)) };
+    rawSetGameState(emptyState as any);
+    
+    setTimeout(() => {
+      const initialState = createInitialGameState(setup);
+      initialState.matchStats = {
+        WHITE: { defeated: 0, damageDealt: 0, damageTaken: 0, damagePrevented: 0, healing: 0, valorEarned: 0, resolveEarned: 0, promotions: 0, supersUsed: 0 },
+        BLACK: { defeated: 0, damageDealt: 0, damageTaken: 0, damagePrevented: 0, healing: 0, valorEarned: 0, resolveEarned: 0, promotions: 0, supersUsed: 0 }
+      };
+      initialState.piecePerformances = {};
+      rawSetGameState(initialState);
+      setIsPaused(false);
+      setIsReviewingMatch(false);
+      setDisplayBottomColor(setup.bottomColor);
+    }, 400);
+  };
+
+  // Create a ref for the timeout to allow clear/reset
+  const aiTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    if (setup) {
+      const initialState = createInitialGameState(setup);
+      initialState.matchStats = {
+        WHITE: { defeated: 0, damageDealt: 0, damageTaken: 0, damagePrevented: 0, healing: 0, valorEarned: 0, resolveEarned: 0, promotions: 0, supersUsed: 0 },
+        BLACK: { defeated: 0, damageDealt: 0, damageTaken: 0, damagePrevented: 0, healing: 0, valorEarned: 0, resolveEarned: 0, promotions: 0, supersUsed: 0 }
+      };
+      initialState.piecePerformances = {};
+      rawSetGameState(initialState);
+      setIsPaused(false);
+      setIsReviewingMatch(false);
+      setDisplayBottomColor(setup.bottomColor);
+    }
+    return () => {
+      if (aiTimeoutRef.current) clearTimeout(aiTimeoutRef.current);
+    }
+  }, [setup]);
+
+  useEffect(() => {
+    if (setup?.mode === 'LOCAL_PVP' && gameState) {
+      const timer = setTimeout(() => {
+        setDisplayBottomColor(gameState.activeColor);
+      }, 1000); // short delay after turn ends
+      return () => clearTimeout(timer);
+    }
+  }, [gameState?.activeColor, setup?.mode]);
+
+  useEffect(() => {
+    if (gameState?.pendingPromotion) {
+      const promoKey = `${gameState.pendingPromotion.r},${gameState.pendingPromotion.c}`;
+      if (lastAnnouncedPromoRef.current !== promoKey) {
+        lastAnnouncedPromoRef.current = promoKey;
+        setPrePromoAnnouncementActive(true);
+        audio.playReady('ability');
+        const timer = setTimeout(() => {
+          setPrePromoAnnouncementActive(false);
+        }, 1800);
+        return () => clearTimeout(timer);
+      }
+    } else {
+      lastAnnouncedPromoRef.current = null;
+    }
+  }, [gameState?.pendingPromotion]);
+
+  useEffect(() => {
+    if (!gameState || gameState.winner || isPaused) return;
+    if (gameState.pendingStartOfTurnPassives && gameState.pendingStartOfTurnPassives.length > 0) {
+      const timer = setTimeout(() => {
+        import('../../lib/game/engine').then(({ resolveNextPassive }) => {
+          setGameState(prev => {
+            if (!prev) return prev;
+            return resolveNextPassive(prev);
+          });
+        });
+      }, 750); // 750ms delay for visual clarity
+      return () => clearTimeout(timer);
+    }
+  }, [gameState, isPaused]);
+
+  useEffect(() => {
+    if (!gameState || gameState.winner || isPaused) return;
+    if (gameState.pendingPromotion || (gameState.pendingEvasions && gameState.pendingEvasions.length > 0)) return;
+    if (gameState.pendingStartOfTurnPassives && gameState.pendingStartOfTurnPassives.length > 0) return;
+
+    const currentPlayer = gameState.activeColor === 'WHITE' ? setup?.playerWhite : setup?.playerBlack;
+    
+    if (currentPlayer && currentPlayer !== 'HUMAN') {
+      const difficulty = currentPlayer as AIDifficulty;
+      
+      const speedMultiplier = gameState.simulationSpeed || 1;
+      const baseDelay = 1500;
+      const delay = baseDelay / speedMultiplier;
+      
+      aiTimeoutRef.current = setTimeout(() => {
+        rawSetGameState(prev => {
+          if (!prev) return prev;
+          const nextState = computeAIMove(prev, difficulty);
+          
+          // Let AI moves go through VFX filter!
+          setTimeout(() => {
+            updateStateWithVFX(nextState);
+          }, 50);
+          return prev; 
+        });
+      }, delay);
+    }
+    
+    return () => {
+      if (aiTimeoutRef.current) clearTimeout(aiTimeoutRef.current);
+    };
+  }, [gameState, isPaused, setup]);
+
+  const getDomCoords = (r: number, c: number) => {
+    const rowIdx = setup?.bottomColor === 'BLACK' ? 7 - r : r;
+    const colIdx = setup?.bottomColor === 'BLACK' ? 7 - c : c;
+    return { rowIdx, colIdx };
+  };
+
+  // Compute connections (Guarded visual link lines overlay)
+  const connections = useMemo(() => {
+    if (!gameState) return [];
+    const list: { id: string; from: Position; to: Position }[] = [];
+    
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const p = gameState.board[r][c];
+        
+        // standard guarding pieces
+        if (p && p.conditions.guarding && p.type !== 'ROYAL_GUARD') {
+          for (let tr = 0; tr < 8; tr++) {
+            for (let tc = 0; tc < 8; tc++) {
+              const tp = gameState.board[tr][tc];
+              if (tp && tp.color === p.color && tp.conditions.guarded > 0 && (tr !== r || tc !== c)) {
+                // If Rook is guarding a specific target, only draw to that piece.
+                if (p.type === 'ROOK' && p.protectedPieceId && tp.id !== p.protectedPieceId) {
+                  continue;
+                }
+                // If Rook is in Bastion mode, only draw to allies within its 2-tile area.
+                if (p.type === 'ROOK' && p.bastionTurns && p.bastionTurns > 0) {
+                  if (Math.abs(tr - r) > 2 || Math.abs(tc - c) > 2) {
+                    continue;
+                  }
+                }
+                list.push({
+                  id: `guard-${p.id}-${tp.id}`,
+                  from: { r, c },
+                  to: { r: tr, c: tc }
+                });
+              }
+            }
+          }
+        }
+        
+        // Guard adjacent to King
+        if (p && p.type === 'ROYAL_GUARD') {
+          const dirs = [[-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]];
+          dirs.forEach(([dr, dc]) => {
+            const nr = r + dr, nc = c + dc;
+            if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+              const kp = gameState.board[nr][nc];
+              if (kp && kp.type === 'KING' && kp.color === p.color) {
+                list.push({
+                  id: `guard-rg-${p.id}-${kp.id}`,
+                  from: { r, c },
+                  to: { r: nr, c: nc }
+                });
+              }
+            }
+          });
+        }
+      }
+    }
+    return list;
+  }, [gameState]);
+
+  if (!gameState) return null;
+
+  const handleTileClick = (r: number, c: number) => {
+    if (gameState.winner) return; // Game over
+    
+    // Prevent interaction while the board is preparing to flip in LOCAL_PVP
+    if (setup?.mode === 'LOCAL_PVP' && displayBottomColor !== gameState.activeColor) {
+      return;
+    }
+    
+    // Tactical evasion handling right on the board
+    if (gameState.pendingEvasions && gameState.pendingEvasions.length > 0) {
+      const evasion = gameState.pendingEvasions[0];
+      const evadingPiece = gameState.board[evasion.r][evasion.c];
+      
+      if (evadingPiece) {
+        const evadingPlayerType = evadingPiece.color === 'WHITE' ? setup?.playerWhite : setup?.playerBlack;
+        if (evadingPlayerType !== 'HUMAN' || isPaused) return;
+      }
+
+      const isJumpTarget = evasion.validJumps.some(j => j.r === r && j.c === c);
+      const isHoldGround = r === evasion.r && c === evasion.c;
+      
+      if (isJumpTarget) {
+        import('../../lib/game/engine').then(({ resolvePendingEvasion }) => {
+          setGameState(resolvePendingEvasion(gameState, evasion.r, evasion.c, r, c));
+        });
+      } else if (isHoldGround) {
+        import('../../lib/game/engine').then(({ resolvePendingEvasion }) => {
+          setGameState(resolvePendingEvasion(gameState, evasion.r, evasion.c, -1, -1));
+        });
+      }
+      return;
+    }
+
+    if (gameState.pendingPromotion) return; // Block clicks during pending promotion
+    
+    const currentPlayer = gameState.activeColor === 'WHITE' ? setup?.playerWhite : setup?.playerBlack;
+    if (currentPlayer !== 'HUMAN' || isPaused) return;
+
+    const clickedPiece = gameState.board[r][c];
+
+    if (
+      gameState.selectedPosition &&
+      gameState.board[gameState.selectedPosition.r][gameState.selectedPosition.c]?.color === gameState.activeColor &&
+      isValidTarget(r, c)
+    ) {
+      if (gameState.activeActionType === 'ABILITY') {
+        import('../../lib/game/engine').then(({ executeAbility }) => {
+          setGameState(executeAbility(gameState, gameState.selectedPosition!, { r, c }));
+        });
+        return;
+      } else if (gameState.activeActionType === 'SUPER') {
+        const selectedPiece = gameState.selectedPosition ? gameState.board[gameState.selectedPosition.r][gameState.selectedPosition.c] : null;
+        if (selectedPiece?.type === 'BISHOP') {
+          const deadAllies = gameState.graveyard[selectedPiece.color].filter(t => t !== 'KING' && t !== 'ROYAL_GUARD');
+          if (deadAllies.length > 0) {
+            setRevivalChoice({
+              from: gameState.selectedPosition!,
+              to: { r, c },
+              deadAllies
+            });
+            return;
+          }
+        }
+        import('../../lib/game/engine').then(({ executeSuper }) => {
+          setGameState(executeSuper(gameState, gameState.selectedPosition!, { r, c }));
+        });
+        return;
+      } else if (gameState.activeActionType === 'MOVE' || (!gameState.activeActionType && !clickedPiece)) {
+        import('../../lib/game/engine').then(({ executeMove }) => {
+          setGameState(executeMove(gameState, gameState.selectedPosition!, { r, c }));
+        });
+        return;
+      } else if (gameState.activeActionType === 'ATTACK' || (!gameState.activeActionType && clickedPiece && clickedPiece.color !== gameState.activeColor)) {
+        import('../../lib/game/engine').then(({ executeAttack }) => {
+          setGameState(executeAttack(gameState, gameState.selectedPosition!, { r, c }));
+        });
+        return;
+      }
+    }
+
+    if (clickedPiece) {
+      let targets: Position[] = [];
+      if (clickedPiece.color === gameState.activeColor) {
+        import('../../lib/game/engine').then(({ getValidMoves, getValidAttacks }) => {
+          const moves = getValidMoves(gameState, r, c);
+          const attacks = getValidAttacks(gameState, r, c);
+          rawSetGameState(prev => ({
+            ...prev!,
+            selectedPosition: { r, c },
+            validTargets: [...moves, ...attacks],
+            skillRangeIndicators: [],
+            activeActionType: null,
+          }));
+        });
+      } else {
+        rawSetGameState(prev => ({
+          ...prev!,
+          selectedPosition: { r, c },
+          validTargets: [],
+          skillRangeIndicators: [],
+          activeActionType: null,
+        }));
+      }
+    } else {
+      rawSetGameState(prev => ({
+        ...prev!,
+        selectedPosition: null,
+        validTargets: [],
+        skillRangeIndicators: [],
+        activeActionType: null,
+      }));
+    }
+  };
+
+  const isSelected = (r: number, c: number) => {
+    if (gameState.pendingEvasions && gameState.pendingEvasions.length > 0) {
+      return gameState.pendingEvasions[0].r === r && gameState.pendingEvasions[0].c === c;
+    }
+    return gameState.selectedPosition?.r === r && gameState.selectedPosition?.c === c;
+  };
+
+  const isValidTarget = (r: number, c: number) => 
+    gameState.validTargets.some(p => p.r === r && p.c === c);
+
+  const getSelectedPiece = () => {
+    if (!gameState.selectedPosition) return null;
+    return gameState.board[gameState.selectedPosition.r][gameState.selectedPosition.c];
+  };
+
+  const hasPendingAction = gameState.pendingPromotion && !prePromoAnnouncementActive;
+
+  return (
+    <div className="flex flex-col w-full h-full max-h-screen relative">
+      <div className={`flex flex-col w-full h-full max-h-screen transition-all duration-300 ${showSettings ? 'filter blur-md pointer-events-none' : ''}`}>
+      <AnimatePresence>
+        {gameState.winner && !isReviewingMatch && (
+          <VictoryOverlay 
+            winner={gameState.winner} 
+            gameState={gameState}
+            onReturn={() => {
+              if (setup?.mode === 'PVE') {
+                setScreen('KINGS_TRIAL');
+              } else if (setup?.mode === 'WAR_TABLE') {
+                setScreen('WAR_TABLE');
+              } else if (setup?.mode === 'LOCAL_PVP') {
+                setScreen('CONQUEST');
+              } else {
+                setScreen('MAIN_MENU');
+              }
+            }} 
+            onPlayAgain={() => {
+              audio.playClick();
+              const newState = createInitialGameState(setup);
+              newState.matchStats = {
+                WHITE: { defeated: 0, damageDealt: 0, damageTaken: 0, damagePrevented: 0, healing: 0, valorEarned: 0, resolveEarned: 0, promotions: 0, supersUsed: 0 },
+                BLACK: { defeated: 0, damageDealt: 0, damageTaken: 0, damagePrevented: 0, healing: 0, valorEarned: 0, resolveEarned: 0, promotions: 0, supersUsed: 0 }
+              };
+              newState.piecePerformances = {};
+              rawSetGameState(newState);
+              setIsPaused(false);
+              setIsReviewingMatch(false);
+            }}
+            onReviewMatch={() => {
+              setIsReviewingMatch(true);
+            }}
+          />
+        )}
+        {gameState.winner && isReviewingMatch && (
+          <div id="review-banner" className="absolute bottom-6 left-1/2 transform -translate-x-1/2 z-50 bg-stone-900/95 border border-blood-500/60 px-6 py-3 rounded-sm shadow-2xl flex items-center gap-4 backdrop-blur-md animate-fade-in">
+            <span className="font-cinzel text-xs text-stone-300 tracking-widest font-semibold uppercase">Reviewing Final Battleground</span>
+            <button 
+              id="show-results-btn"
+              onClick={() => { audio.playClick(); setIsReviewingMatch(false); }}
+              className="bg-blood-600 hover:bg-blood-500 text-stone-100 font-cinzel text-[10px] font-bold px-4 py-2 rounded-sm tracking-widest uppercase transition-all shadow-md active:scale-95"
+            >
+              Show Results
+            </button>
+          </div>
+        )}
+        {superAnnouncement && (
+          <SuperAnnouncementOverlay name={superAnnouncement.name} type={superAnnouncement.type} />
+        )}
+        {lastStandAnnouncement && (
+          <LastStandAnnouncementOverlay name="Last Stand" />
+        )}
+        {promoAnnouncement && (
+          <PromoAnnouncementOverlay name={promoAnnouncement.name} />
+        )}
+        {prePromoAnnouncementActive && (
+          <PrePromoAnnouncementOverlay />
+        )}
+      </AnimatePresence>
+
+      {/* Pending Promotion Choice Backdrop */}
+      {hasPendingAction && (
+        <div className="fixed inset-0 bg-black/85 z-50 flex items-center justify-center backdrop-blur-md p-4 overflow-y-auto">
+          {gameState.pendingPromotion && (
+            <motion.div 
+              initial={{ opacity: 0, y: 20, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              transition={{ duration: 0.4 }}
+              className="bg-gradient-to-b from-stone-900 to-stone-950 border border-red-600/40 p-6 md:p-8 rounded-xl max-w-md md:max-w-xl w-full shadow-[0_0_50px_rgba(220,38,38,0.25)] flex flex-col items-center relative overflow-hidden animate-glow-red"
+            >
+              <div className="absolute top-0 left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-red-500 to-transparent" />
+              <Sparkles className="w-8 h-8 text-red-500 mb-2 animate-pulse" />
+              <h2 className="text-xl text-red-500 tracking-widest font-bold text-center uppercase font-cinzel mb-1">
+                Mantle Ascension
+              </h2>
+              <p className="text-stone-400 text-[11px] font-sans text-center mb-6 max-w-sm leading-relaxed">
+                Your brave Soldier has reached the final rank. Elevate their mantle to a legendary rank and unleash their true potential.
+              </p>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 w-full">
+                {(['ROOK', 'KNIGHT', 'BISHOP'] as const).map((type) => {
+                  const details = PIECE_PROMO_RES_DETAILS[type];
+                  return (
+                    <button
+                      key={type}
+                      onClick={() => handlePromotionChoice(type)}
+                      className="flex flex-col items-center bg-stone-950/60 border border-stone-850 hover:border-red-500/60 p-4 rounded-lg transition-all duration-300 hover:bg-stone-900/60 hover:shadow-[0_0_20px_rgba(220,38,38,0.15)] group text-center h-full relative"
+                    >
+                      {/* Icon Container */}
+                      <div className="w-12 h-12 rounded-full bg-stone-900 border border-stone-800 flex items-center justify-center mb-3 group-hover:border-red-500/50 group-hover:bg-red-950/20 transition-all shadow-[inset_0_0_10px_rgba(0,0,0,0.6)]">
+                        <PieceIcon type={type} color={gameState?.activeColor || 'WHITE'} className="w-8 h-8 filter drop-shadow-[0_2px_4px_rgba(0,0,0,0.5)] group-hover:scale-110 transition-transform" />
+                      </div>
+
+                      {/* Name */}
+                      <span className="font-cinzel text-sm text-stone-100 font-bold group-hover:text-red-400 transition-colors tracking-wide">
+                        {details.name}
+                      </span>
+
+                      {/* Class */}
+                      <span className="text-[9px] text-red-400 font-mono uppercase tracking-widest mt-1 bg-red-950/40 border border-red-900/30 px-2.5 py-0.5 rounded-full mb-3">
+                        {getStrictClass(type)}
+                      </span>
+
+                      {/* Description */}
+                      <p className="text-[10px] text-stone-400 leading-relaxed font-sans flex-grow">
+                        {details.desc}
+                      </p>
+
+                      {/* Action Label */}
+                      <div className="mt-4 w-full py-1.5 bg-stone-900 border border-stone-800 text-[9px] tracking-widest font-cinzel text-stone-400 uppercase rounded group-hover:bg-red-600 group-hover:border-red-500 group-hover:text-white transition-all font-bold">
+                        Select Mantle
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </motion.div>
+          )}
+        </div>
+      )}
+
+      {/* Top Task Bar */}
+      <div className="w-full h-16 border-b border-stone-850 bg-stone-900/60 backdrop-blur-md flex items-center justify-between px-4 md:px-8 flex-shrink-0 relative z-30 shadow-lg">
+        {/* Decorative corner visual accents */}
+        <span className="absolute bottom-0 left-0 w-8 h-[1px] bg-red-600/30"></span>
+        <span className="absolute bottom-0 right-0 w-8 h-[1px] bg-red-600/30"></span>
+        <span className="absolute bottom-0 left-0 right-0 h-[1px] bg-gradient-to-r from-transparent via-stone-800 to-transparent"></span>
+
+        {/* Left Wing: Turn Counter & Active Player Indicator (Red Accent) */}
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 border border-red-900/40 bg-red-950/30 rounded px-3 py-1 shadow-[inset_0_0_8px_rgba(239,68,68,0.08)]">
+            <span className="font-cinzel text-[10px] text-red-400 font-bold tracking-wider uppercase">Turn</span>
+            <span className="font-mono text-xs font-bold text-red-500 bg-red-500/10 px-1.5 py-0.5 rounded border border-red-500/20 shadow-[0_0_10px_rgba(239,68,68,0.2)]">
+              {gameState.turn}
+            </span>
+            <div className="w-px h-3.5 bg-red-900/35 mx-1"></div>
+            <div className="flex items-center gap-1.5">
+              <span className={`w-2 h-2 rounded-full ${gameState.activeColor === 'WHITE' ? 'bg-stone-100 shadow-[0_0_8px_rgba(255,255,255,0.5)]' : 'bg-red-600 shadow-[0_0_8px_rgba(220,38,38,0.5)] animate-pulse'}`}></span>
+              <span className="font-cinzel text-[10px] tracking-wider uppercase text-stone-300">
+                {gameState.specialTurnState === 'ACTIVE' ? (
+                  <span className="text-amber-400 font-bold animate-pulse">King's Command</span>
+                ) : (
+                  gameState.activeColor === 'WHITE' ? "White's Turn" : "Black's Turn"
+                )}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* Center: RPG Mode Crest & Emblem */}
+        <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center pointer-events-none select-none">
+          <div className="flex items-center gap-2">
+            {setup?.mode === 'LOCAL_PVP' && (
+              <>
+                <Swords className="w-4 h-4 text-stone-400 animate-pulse hidden lg:block" />
+                <span className="font-cinzel text-sm md:text-base tracking-[0.2em] font-bold text-stone-100 uppercase">
+                  Conquest Match
+                </span>
+                <Swords className="w-4 h-4 text-stone-400 animate-pulse hidden lg:block" />
+              </>
+            )}
+            {setup?.mode === 'PVE' && (
+              <>
+                <Crown className="w-4 h-4 text-red-500 animate-pulse hidden lg:block" />
+                <span className="font-cinzel text-sm md:text-base tracking-[0.25em] font-bold text-red-500 uppercase drop-shadow">
+                  King's Trial
+                </span>
+                <Crown className="w-4 h-4 text-red-500 animate-pulse hidden lg:block" />
+              </>
+            )}
+            {setup?.mode === 'WAR_TABLE' && (
+              <>
+                <Sparkles className="w-4 h-4 text-blood-400 animate-pulse hidden lg:block" />
+                <span className="font-cinzel text-sm md:text-base tracking-[0.2em] font-bold text-stone-300 uppercase">
+                  War Table Simulation
+                </span>
+                <Sparkles className="w-4 h-4 text-blood-400 animate-pulse hidden lg:block" />
+              </>
+            )}
+          </div>
+          <span className="font-mono text-[9px] text-stone-500 tracking-[0.3em] uppercase mt-0.5">
+            {setup?.mode === 'LOCAL_PVP' && 'Lanes of Glory'}
+            {setup?.mode === 'PVE' && 'Challenge the Realm'}
+            {setup?.mode === 'WAR_TABLE' && 'Observe & Analyze'}
+          </span>
+        </div>
+
+        {/* Right Wing: All Action Buttons and Settings */}
+        <div className="flex items-center gap-2 md:gap-3">
+          {setup?.mode === 'WAR_TABLE' && (
+            <>
+              {isPaused ? (
+                <button 
+                  onMouseEnter={() => audio.playHover()}
+                  onClick={() => { audio.playClick(); setIsPaused(false); }} 
+                  className="font-cinzel text-xs uppercase tracking-wider text-red-500 hover:text-red-400 border border-red-900/30 bg-red-950/10 hover:bg-red-950/20 hover:border-red-500/50 rounded px-2.5 py-1.5 transition-all duration-200 flex items-center gap-1 shadow-[0_0_10px_rgba(239,68,68,0.05)]"
+                >
+                  <Play className="w-3.5 h-3.5 fill-red-500/20" /> Resume
+                </button>
+              ) : (
+                <button 
+                  onMouseEnter={() => audio.playHover()}
+                  onClick={() => { audio.playClick(); setIsPaused(true); }} 
+                  className="font-cinzel text-xs uppercase tracking-wider text-stone-300 hover:text-stone-100 border border-stone-800 bg-stone-950/40 hover:bg-stone-900 hover:border-stone-700 rounded px-2.5 py-1.5 transition-all duration-200 flex items-center gap-1"
+                >
+                  <Pause className="w-3.5 h-3.5" /> Pause
+                </button>
+              )}
+              
+              <div className="hidden md:flex items-center gap-1 border border-stone-800/80 bg-stone-950/50 px-2 py-1 rounded">
+                <span className="font-cinzel text-[9px] text-stone-500 tracking-wider uppercase pr-2 border-r border-stone-900">Speed</span>
+                <div className="flex gap-1 pl-1">
+                  {[1, 2, 3].map(speed => (
+                    <button
+                      key={speed}
+                      onMouseEnter={() => audio.playHover()}
+                      onClick={() => { 
+                        audio.playClick(); 
+                        rawSetGameState(prev => prev ? { ...prev, simulationSpeed: speed as 1|2|3 } : prev); 
+                      }}
+                      className={`font-mono text-[10px] font-bold px-1.5 py-0.5 rounded transition-all ${
+                        (gameState?.simulationSpeed || 1) === speed 
+                          ? 'bg-red-500/10 text-red-500 border border-red-500/20 shadow-[0_0_8px_rgba(239,68,68,0.15)]' 
+                          : 'text-stone-500 hover:text-stone-300 hover:bg-stone-900'
+                      }`}
+                    >
+                      {speed}x
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="w-px h-5 bg-stone-850 self-center hidden sm:block"></div>
+
+              <button 
+                onMouseEnter={() => audio.playHover()}
+                onClick={() => { audio.playClick(); setScreen('WAR_TABLE'); }} 
+                className="font-cinzel text-xs uppercase tracking-wider text-stone-400 hover:text-stone-200 border border-stone-800 bg-stone-950/20 hover:bg-stone-900 hover:border-stone-700 rounded px-2.5 py-1.5 transition-all duration-200 flex items-center gap-1"
+              >
+                <LogOut className="w-3.5 h-3.5" /> Exit
+              </button>
+            </>
+          )}
+
+          {setup?.mode === 'PVE' && (
+            <>
+              <button 
+                onMouseEnter={() => audio.playHover()}
+                onClick={() => { audio.playClick(); handleRestart(); }} 
+                className="font-cinzel text-xs uppercase tracking-wider text-stone-400 hover:text-stone-200 border border-stone-800 bg-stone-950/20 hover:bg-stone-900 hover:border-stone-700 rounded px-2.5 py-1.5 transition-all duration-200 flex items-center gap-1"
+              >
+                <RotateCcw className="w-3.5 h-3.5" /> Restart Duel
+              </button>
+              <button 
+                onMouseEnter={() => audio.playHover()}
+                onClick={() => { audio.playClick(); setScreen('KINGS_TRIAL'); }} 
+                className="font-cinzel text-xs uppercase tracking-wider text-stone-400 hover:text-stone-200 border border-stone-800 bg-stone-950/20 hover:bg-stone-900 hover:border-stone-700 rounded px-2.5 py-1.5 transition-all duration-200 flex items-center gap-1"
+              >
+                <Flag className="w-3.5 h-3.5" /> Concede
+              </button>
+            </>
+          )}
+
+          {setup?.mode === 'LOCAL_PVP' && (
+            <>
+              <button 
+                onMouseEnter={() => audio.playHover()}
+                onClick={() => { audio.playClick(); handleRestart(); }} 
+                className="font-cinzel text-xs uppercase tracking-wider text-stone-400 hover:text-stone-200 border border-stone-800 bg-stone-950/20 hover:bg-stone-900 hover:border-stone-700 rounded px-2.5 py-1.5 transition-all duration-200 flex items-center gap-1"
+              >
+                <RotateCcw className="w-3.5 h-3.5" /> Restart
+              </button>
+              <button 
+                onMouseEnter={() => audio.playHover()}
+                onClick={() => { audio.playClick(); setScreen('CONQUEST'); }} 
+                className="font-cinzel text-xs uppercase tracking-wider text-stone-400 hover:text-stone-200 border border-stone-800 bg-stone-950/20 hover:bg-stone-900 hover:border-stone-700 rounded px-2.5 py-1.5 transition-all duration-200 flex items-center gap-1"
+              >
+                <LogOut className="w-3.5 h-3.5" /> Exit
+              </button>
+            </>
+          )}
+
+          <div className="w-px h-5 bg-stone-850 self-center hidden sm:block"></div>
+
+          <button 
+            onMouseEnter={() => audio.playHover()}
+            onClick={() => { audio.playClick(); setShowSettings(true); }} 
+            className="font-cinzel text-xs uppercase tracking-wider text-stone-400 hover:text-stone-200 border border-stone-800 bg-stone-950/20 hover:bg-stone-900 hover:border-stone-700 rounded px-2.5 py-1.5 transition-all duration-200 flex items-center gap-1"
+          >
+            <Settings className="w-3.5 h-3.5" /> <span className="hidden sm:inline">Settings</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="w-full max-w-[1600px] mx-auto grid grid-cols-1 xl:grid-cols-[340px_minmax(0,1fr)_340px] gap-6 p-4 flex-grow min-h-0 items-center">
+        
+        {/* Left Panel */}
+        <div className="hidden xl:flex w-full h-full min-h-0">
+          <LeftPanel gameState={gameState} />
+        </div>
+
+        {/* Center Board Column */}
+        <div className="flex flex-col items-center w-full max-w-[min(100vw-2rem,100vh-6rem)] min-h-0 mx-auto justify-center h-full">
+          {/* HUD Header */}
+          <div className="w-full flex justify-between items-center mb-4 px-4">
+            <div className={`font-cinzel text-xl ${gameState.activeColor === 'WHITE' ? 'text-stone-200 drop-shadow-md' : 'text-stone-600'}`}>
+              White Kingdom
+            </div>
+            <div className="font-sans text-stone-500 text-sm tracking-widest uppercase">
+              {gameState.specialTurnState === 'ACTIVE' ? (
+                <span className="text-amber-500 animate-pulse font-bold font-cinzel">Special Turn</span>
+              ) : (
+                `Turn ${gameState.turn}`
+              )}
+            </div>
+            <div className={`font-cinzel text-xl ${gameState.activeColor === 'BLACK' ? 'text-blood-500 drop-shadow-md' : 'text-stone-600'}`}>
+              Black Kingdom
+            </div>
+          </div>
+
+          {/* The Board container (Framer Motion driven shaking + rotation) */}
+          <motion.div 
+            className="w-full aspect-square bg-stone-950 p-1 md:p-2 border border-stone-800 rounded-sm shadow-2xl relative select-none"
+            animate={shake === 'none' 
+              ? { rotate: displayBottomColor !== (setup?.bottomColor || 'WHITE') ? 180 : 0 }
+              : { 
+                  rotate: displayBottomColor !== (setup?.bottomColor || 'WHITE') ? 180 : 0,
+                  x: shake === 'small' ? [0, -3, 3, -3, 3, 0] : shake === 'medium' ? [0, -6, 6, -6, 6, 0] : [0, -12, 12, -12, 12, 0],
+                  y: shake === 'small' ? [0, 2, -2, 2, -2, 0] : shake === 'medium' ? [0, 4, -4, 4, -4, 0] : [0, 8, -8, 8, -8, 0]
+                }
+            }
+            transition={shake === 'none' 
+              ? { duration: 0.6, ease: "easeInOut" }
+              : { duration: shake === 'small' ? 0.25 : shake === 'medium' ? 0.35 : 0.5, ease: "easeInOut" }
+            }
+          >
+            <div className="w-full h-full grid grid-cols-8 grid-rows-8 border-2 border-stone-800/50 shadow-inner relative z-10">
+              {(() => {
+                const selectedPieceForGrid = getSelectedPiece();
+                return Array.from({ length: 64 }).map((_, idx) => {
+                  const rIndex = Math.floor(idx / 8);
+                  const cIndex = idx % 8;
+                  const r = setup?.bottomColor === 'BLACK' ? 7 - rIndex : rIndex;
+                  const c = setup?.bottomColor === 'BLACK' ? 7 - cIndex : cIndex;
+                  let piece = gameState.board[r][c];
+                  const isDying = !piece && dyingPiece && dyingPiece.r === r && dyingPiece.c === c;
+                  if (isDying) {
+                    piece = dyingPiece.piece;
+                  }
+                  const isLight = (r + c) % 2 === 0;
+                  const isFlipped = displayBottomColor !== (setup?.bottomColor || 'WHITE');
+                  let isTarget = isValidTarget(r, c);
+                  if (gameState.pendingEvasions && gameState.pendingEvasions.length > 0) {
+                    isTarget = gameState.pendingEvasions[0].validJumps.some(j => j.r === r && j.c === c);
+                  }
+
+                  // Coordinate translations for melee animations
+                  const isLunging = activeLunge && activeLunge.from.r === r && activeLunge.from.c === c;
+                  const isFlinching = activeFlinch && activeFlinch.r === r && activeFlinch.c === c;
+                  const isJumping = piece && jumpingPieces[piece.id];
+                  
+                  const baseAnimSpeed = parseFloat(localStorage.getItem('animationSpeed') || '1.0');
+                  const speedMultiplier = (setup?.mode === 'WAR_TABLE' && gameState.simulationSpeed) ? gameState.simulationSpeed : 1;
+                  const animSpeed = baseAnimSpeed / speedMultiplier;
+                  
+                  const isBlackBottom = setup?.bottomColor === 'BLACK';
+                  const lungeMult = isBlackBottom ? -1 : 1;
+                  const lungeX = isLunging ? (activeLunge!.to.c - activeLunge!.from.c) * 45 * lungeMult : 0;
+                  const lungeY = isLunging ? (activeLunge!.to.r - activeLunge!.from.r) * 45 * lungeMult : 0;
+                  const flinchX = isFlinching && activeLunge ? Math.sign(activeLunge.to.c - activeLunge.from.c) * 12 * lungeMult : 0;
+                  const flinchY = isFlinching && activeLunge ? Math.sign(activeLunge.to.r - activeLunge.from.r) * 12 * lungeMult : 0;
+
+                  const auraType = suppressedAuraGrid[r][c];
+                  const isSuppressedAura = auraType !== '';
+
+                  const bastionAuraType = bastionAuraGrid[r][c];
+                  const isBastionAura = bastionAuraType !== '';
+
+                  let isPieceUnaffected = false;
+                  if (piece) {
+                    if (piece.type === 'KING' || piece.type === 'QUEEN' || piece.type === 'ROYAL_GUARD') {
+                      isPieceUnaffected = true;
+                    } else if (isSuppressedAura) {
+                      if (auraType === 'BOTH') {
+                        isPieceUnaffected = false;
+                      } else if (auraType === piece.color) {
+                        isPieceUnaffected = true;
+                      }
+                    }
+                  }
+
+                  // Determine if this is a positive/allied-benefiting target
+                  let isPositiveTarget = false;
+                  let isAbilityTarget = false;
+
+                  if (selectedPieceForGrid && (gameState.activeActionType === 'ABILITY' || gameState.activeActionType === 'SUPER')) {
+                    isAbilityTarget = true;
+                    if (gameState.activeActionType === 'ABILITY') {
+                      if (selectedPieceForGrid.type === 'ROOK') {
+                        // Rook's Protect targets allies
+                        isPositiveTarget = true;
+                      } else if (selectedPieceForGrid.type === 'BISHOP') {
+                        // Bishop's Divine Judgement is positive if used to heal an ally
+                        if (piece && piece.color === selectedPieceForGrid.color) {
+                          isPositiveTarget = true;
+                        }
+                      } else if (selectedPieceForGrid.type === 'KING') {
+                        // King's Royal Reinforcement summons a Guard (on empty squares)
+                        isPositiveTarget = true;
+                      } else if (selectedPieceForGrid.type === 'PAWN') {
+                        // Pawn's Brace is self-targeted
+                        if (r === gameState.selectedPosition!.r && c === gameState.selectedPosition!.c) {
+                          isPositiveTarget = true;
+                        }
+                      }
+                    } else if (gameState.activeActionType === 'SUPER') {
+                      if (selectedPieceForGrid.type === 'BISHOP') {
+                        // Bishop's Resurrection revives an ally on back rank
+                        isPositiveTarget = true;
+                      } else if (selectedPieceForGrid.type === 'ROOK') {
+                        // Rook's Bastion is self-targeted
+                        if (r === gameState.selectedPosition!.r && c === gameState.selectedPosition!.c) {
+                          isPositiveTarget = true;
+                        }
+                      } else if (selectedPieceForGrid.type === 'KING') {
+                        // King's Command is self-targeted
+                        if (r === gameState.selectedPosition!.r && c === gameState.selectedPosition!.c) {
+                          isPositiveTarget = true;
+                        }
+                      }
+                    }
+                  }
+
+                  const isRookGuarding = !!guardingAuras[`${r}_${c}`];
+                  const guardedData = guardedAuras[`${r}_${c}`];
+                  const isRookGuarded = !!guardedData;
+                  const isPulsatingGuardian = !!pulsatingGuardians[`${r}_${c}`];
+                  const isPulsatingGuarded = !!pulsatingGuarded[`${r}_${c}`];
+                  const isSkillRangeIndicator = !!gameState.skillRangeIndicators?.some(p => p.r === r && p.c === c);
+
+                  return (
+                    <Tile 
+                      key={`${r}-${c}`}
+                      position={{r, c}}
+                      isLight={isLight}
+                      isSelected={isSelected(r, c)}
+                      isValidTarget={isTarget}
+                      isLastMove={false}
+                      isFrozen={piece && piece.conditions.frozen > 0}
+                      isCharmed={piece && piece.conditions.charmed > 0}
+                      isSuppressedAura={isSuppressedAura}
+                      isBastionAura={isBastionAura}
+                      isPieceUnaffected={isPieceUnaffected}
+                      isPositiveTarget={isPositiveTarget}
+                      isAbilityTarget={isAbilityTarget}
+                      isSkillRangeIndicator={isSkillRangeIndicator}
+                      hasPiece={!!piece}
+                      isRookGuarding={isRookGuarding}
+                      isRookGuarded={isRookGuarded}
+                      isPulsatingGuardian={isPulsatingGuardian}
+                      isPulsatingGuarded={isPulsatingGuarded}
+                      onClick={() => handleTileClick(r, c)}
+                    >
+                    {piece && (
+                      <motion.div
+                        className="w-full h-full flex items-center justify-center relative"
+                        animate={
+                          isJumping
+                            ? { y: isFlipped ? [0, 28, 0] : [0, -28, 0], scale: [1, 1.15, 0.95, 1], x: 0, rotate: 0 }
+                            : isLunging
+                              ? { x: [0, lungeX, 0], y: [0, lungeY, 0], rotate: 0 }
+                              : isFlinching
+                                ? { rotate: [0, 45, 0], x: 0, y: 0, scale: 1 }
+                                : { x: 0, y: 0, scale: 1, rotate: 0 }
+                        }
+                        transition={
+                          isJumping
+                            ? { duration: 0.45 * animSpeed, times: [0, 0.4, 0.8, 1.0], ease: "easeInOut" }
+                            : isLunging 
+                              ? { duration: 0.35 * animSpeed, times: [0, 0.3, 1.0], ease: "easeInOut" }
+                              : isFlinching 
+                                ? { duration: 0.25 * animSpeed, ease: "easeOut" }
+                                : undefined
+                        }
+                      >
+                        <GamePiece piece={piece} isSelected={isSelected(r, c)} isFlipped={isFlipped} isEnemy={piece.color !== displayBottomColor} />
+                        
+                        {/* Quick red slash overlay effect */}
+                        {isFlinching && (
+                          <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-30">
+                            <svg className="w-full h-full overflow-visible" viewBox="0 0 100 100">
+                              <motion.line
+                                x1="10"
+                                y1="10"
+                                x2="90"
+                                y2="90"
+                                stroke="#ef4444"
+                                strokeWidth="8"
+                                strokeLinecap="round"
+                                initial={{ pathLength: 0, opacity: 0 }}
+                                animate={{ pathLength: [0, 1, 1], opacity: [0, 1, 1, 0] }}
+                                transition={{ duration: 0.2, ease: "easeOut" }}
+                                style={{ filter: 'drop-shadow(0px 0px 4px #ef4444)' }}
+                              />
+                            </svg>
+                          </div>
+                        )}
+                      </motion.div>
+                    )}
+                    {warpPromoSquare && warpPromoSquare.r === r && warpPromoSquare.c === c && (
+                      <motion.div
+                        initial={{ scale: 0.1, opacity: 0 }}
+                        animate={{ scale: [0.1, 1.25, 0.8, 1.1, 1], opacity: [0, 1, 1, 1, 1] }}
+                        transition={{ duration: 0.55 }}
+                        className="absolute inset-0 bg-red-600/30 border border-red-500 rounded-lg pointer-events-none z-30 flex items-center justify-center overflow-hidden"
+                      >
+                        <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(220,38,38,0.45)_0%,transparent_70%)] animate-pulse" />
+                        <motion.div
+                          animate={{ rotate: 360 }}
+                          transition={{ repeat: Infinity, duration: 1.5, ease: "linear" }}
+                          className="w-10 h-10 border-2 border-red-500 border-t-transparent border-b-transparent rounded-full absolute"
+                        />
+                        <motion.div
+                          animate={{ rotate: -360 }}
+                          transition={{ repeat: Infinity, duration: 0.9, ease: "linear" }}
+                          className="w-7 h-7 border border-red-400 border-l-transparent border-r-transparent rounded-full absolute"
+                        />
+                        <div className="w-2 h-2 rounded-full bg-white animate-ping absolute" />
+                      </motion.div>
+                    )}
+                  </Tile>
+                );
+              })})()}
+            </div>
+
+            {/* Floating texts absolute canvas overlays */}
+            {floatingTexts.map((ft) => {
+              const { rowIdx, colIdx } = getDomCoords(ft.r, ft.c);
+              const x = `${(colIdx + 0.5) * 12.5}%`;
+              const y = `${(rowIdx + 0.5) * 12.5}%`;
+              return (
+                <div 
+                  key={ft.id} 
+                  className="absolute pointer-events-none z-40 flex items-center justify-center" 
+                  style={{ 
+                    left: x, 
+                    top: y, 
+                    transform: displayBottomColor !== (setup?.bottomColor || 'WHITE') ? 'rotate(180deg)' : 'none' 
+                  }}
+                >
+                  <FloatingText text={ft.text} type={ft.type} onComplete={() => removeFloatingText(ft.id)} />
+                </div>
+              );
+            })}
+
+            {/* Radial Particle emitters absolute canvas overlays */}
+            {particles.map((pt) => {
+              const { rowIdx, colIdx } = getDomCoords(pt.r, pt.c);
+              const x = `${(colIdx + 0.5) * 12.5}%`;
+              const y = `${(rowIdx + 0.5) * 12.5}%`;
+              return (
+                <div 
+                  key={pt.id} 
+                  className="absolute pointer-events-none z-35" 
+                  style={{ 
+                    left: x, 
+                    top: y, 
+                    width: '12.5%', 
+                    height: '12.5%', 
+                    marginLeft: '-6.25%', 
+                    marginTop: '-6.25%' 
+                  }}
+                >
+                  <ParticleEmitter type={pt.type} onComplete={() => removeParticle(pt.id)} />
+                </div>
+              );
+            })}
+          </motion.div>
+          
+          {/* Status Footer and Controls */}
+          <div className="mt-6 flex flex-col items-center gap-2">
+            <div className="font-cinzel text-stone-400 tracking-wider text-center h-8">
+              {gameState.pendingEvasions && gameState.pendingEvasions.length > 0 ? "Grand Paladin is evading. Select a highlighted square, or click the Paladin to hold ground." : gameState.statusMessage}
+            </div>
+          </div>
+        </div>
+
+        {/* Right Panel */}
+        <div className="hidden xl:flex w-full h-full min-h-0">
+          <PieceDetailsPanel 
+            piece={getSelectedPiece()} 
+            activeActionType={gameState.activeActionType}
+            isEnemy={getSelectedPiece() ? getSelectedPiece()!.color !== displayBottomColor : false}
+            gameState={gameState}
+            onActionSelect={
+              getSelectedPiece()?.color === gameState.activeColor && 
+              (gameState.activeColor === 'WHITE' ? setup?.playerWhite : setup?.playerBlack) === 'HUMAN' &&
+              !isPaused
+                ? (type) => {
+                    if (!gameState.selectedPosition) return;
+                    import('../../lib/game/engine').then(({ getValidAbilityTargets, getValidSuperTargets, getSkillRangeIndicators }) => {
+                      const targets = type === 'ABILITY' 
+                        ? getValidAbilityTargets(gameState, gameState.selectedPosition!.r, gameState.selectedPosition!.c)
+                        : getValidSuperTargets(gameState, gameState.selectedPosition!.r, gameState.selectedPosition!.c);
+                      const indicators = getSkillRangeIndicators(gameState, gameState.selectedPosition!.r, gameState.selectedPosition!.c, type);
+                      
+                      rawSetGameState(prev => ({
+                        ...prev!,
+                        activeActionType: type,
+                        validTargets: targets,
+                        skillRangeIndicators: indicators
+                      }));
+                    });
+                  }
+                : undefined
+            }
+          />
+        </div>
+
+      </div>
+      </div>
+
+      <AnimatePresence>
+        {showSettings && (
+          <SettingsScreen isModal={true} onClose={() => setShowSettings(false)} />
+        )}
+      </AnimatePresence>
+
+      {/* Revival Choice Modal */}
+      <AnimatePresence>
+        {revivalChoice && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-4 overflow-y-auto">
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.95, opacity: 0, y: 20 }}
+              transition={{ duration: 0.3 }}
+              className="bg-gradient-to-b from-stone-900 to-stone-950 border border-emerald-500/30 p-6 md:p-8 rounded-xl max-w-md md:max-w-xl w-full shadow-[0_0_50px_rgba(16,185,129,0.2)] flex flex-col items-center relative overflow-hidden animate-glow-emerald"
+            >
+              <div className="absolute top-0 left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-emerald-500 to-transparent" />
+              <Crown className="w-8 h-8 text-emerald-400 mb-2 animate-pulse" />
+              <h3 className="font-cinzel text-xl text-emerald-400 tracking-widest font-bold uppercase mb-1">
+                Resurrection Choice
+              </h3>
+              <p className="text-[11px] text-stone-400 mb-6 font-sans text-center max-w-sm leading-relaxed">
+                A miracle is within reach. High Cleric channels the sacred ritual. Select a fallen soul from the graveyard to revive onto your back rank.
+              </p>
+
+              {/* Scrollable Catalog of Fallen Souls */}
+              <div className="w-full max-h-[280px] overflow-y-auto pr-1 mb-6 scrollbar-thin scrollbar-thumb-emerald-500/30 scrollbar-track-stone-950/50">
+                {revivalChoice.deadAllies.length === 0 ? (
+                  <div className="text-center py-8 text-stone-500 text-xs font-sans">
+                    No eligible souls await resurrection.
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 p-1">
+                    {Array.from(new Set(revivalChoice.deadAllies)).map((type) => {
+                      const count = revivalChoice.deadAllies.filter(t => t === type).length;
+                      const details = PIECE_PROMO_RES_DETAILS[type] || { name: type, class: 'Unknown', desc: 'No lore available.' };
+                      
+                      return (
+                        <button
+                          key={type}
+                          onClick={() => handleRevivalSelection(type)}
+                          className="flex flex-col items-center bg-stone-950/60 border border-stone-850 hover:border-emerald-500/60 p-4 rounded-lg transition-all duration-300 hover:bg-stone-900/60 hover:shadow-[0_0_20px_rgba(16,185,129,0.15)] group text-center h-full relative animate-fade-in"
+                        >
+                          {/* Quantity Badge */}
+                          {count > 1 && (
+                            <span className="absolute top-2 right-2 text-[8px] bg-emerald-950/80 text-emerald-400 border border-emerald-800/40 px-1.5 py-0.5 rounded font-mono">
+                              x{count}
+                            </span>
+                          )}
+
+                          {/* Icon Container */}
+                          <div className="w-12 h-12 rounded-full bg-stone-900 border border-stone-800 flex items-center justify-center mb-3 group-hover:border-emerald-500/50 group-hover:bg-emerald-950/20 transition-all shadow-[inset_0_0_10px_rgba(0,0,0,0.6)]">
+                            <PieceIcon type={type} color={gameState?.activeColor || 'WHITE'} className="w-8 h-8 filter drop-shadow-[0_2px_4px_rgba(0,0,0,0.5)] group-hover:scale-110 transition-transform" />
+                          </div>
+
+                          {/* Name */}
+                          <span className="font-cinzel text-sm text-stone-100 font-bold group-hover:text-emerald-400 transition-colors tracking-wide">
+                            {details.name}
+                          </span>
+
+                          {/* Class */}
+                          <span className="text-[9px] text-emerald-400/80 font-mono uppercase tracking-widest mt-1 bg-emerald-950/40 border border-emerald-900/30 px-2 py-0.5 rounded-full mb-2">
+                            {getStrictClass(type)}
+                          </span>
+
+                          {/* Description */}
+                          <p className="text-[10px] text-stone-400 leading-relaxed font-sans flex-grow">
+                            {details.desc}
+                          </p>
+
+                          {/* Action Button Label */}
+                          <div className="mt-4 w-full py-1.5 bg-stone-900 border border-stone-800 text-[9px] tracking-widest font-cinzel text-stone-400 uppercase rounded group-hover:bg-emerald-600 group-hover:border-emerald-500 group-hover:text-stone-950 transition-all font-bold">
+                            Summon Soul
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              <button
+                onClick={() => setRevivalChoice(null)}
+                className="font-cinzel text-[10px] text-stone-400 hover:text-stone-200 tracking-widest uppercase transition-colors border border-stone-800 hover:border-stone-700 px-5 py-2 rounded bg-stone-950/60"
+              >
+                Cancel Ritual
+              </button>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}

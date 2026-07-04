@@ -1,0 +1,7 @@
+    const isThreatened = enemyPieces.some(ep => canPieceAttackTarget(gameState.board, ep.p, ep.r, ep.c, r, c));
+    const defenseMultiplier = isThreatened ? 1.0 : 0.2;
+
+    if (p.conditions.shielded) resScore += 4.0 * statusMult * defenseMultiplier;
+    if (p.conditions.guarded > 0) resScore += p.conditions.guarded * 3.0 * statusMult * defenseMultiplier;
+    if (p.conditions.guarding) resScore += 2.0 * statusMult;
+    if (p.conditions.armored > 0) resScore += p.conditions.armored * 1.5 * statusMult * defenseMultiplier;

@@ -1,0 +1,120 @@
+export type ScreenState = 
+  | 'MAIN_MENU' 
+  | 'CONQUEST' 
+  | 'KINGS_TRIAL' 
+  | 'WAR_TABLE' 
+  | 'CODEX' 
+  | 'SETTINGS' 
+  | 'GAME';
+
+export type GameMode = 'LOCAL_PVP' | 'PVE' | 'WAR_TABLE';
+export type AIDifficulty = 'SQUIRE' | 'KNIGHT' | 'GENERAL' | 'SOVEREIGN';
+
+export interface GameSetup {
+  mode: GameMode;
+  playerWhite?: 'HUMAN' | AIDifficulty;
+  playerBlack?: 'HUMAN' | AIDifficulty;
+  bottomColor: 'WHITE' | 'BLACK';
+}
+
+export type PieceType = 'KING' | 'QUEEN' | 'ROOK' | 'KNIGHT' | 'BISHOP' | 'PAWN' | 'ROYAL_GUARD';
+export type PieceColor = 'WHITE' | 'BLACK';
+
+export interface Conditions {
+  shielded: boolean;       // Negates next incoming damage, then removed
+  armored: number;         // Flat reduction of incoming damage
+  guarded: number;         // Flat damage reduction, redirected to Guarding ally (max 2 instances)
+  empowered: number;       // Modification of Attack power (+/- ATK)
+  haste: boolean;          // Improves movement (e.g. King Last Stand 2-tile slide)
+  frozen: number;          // Cannot move, attack, or use abilities (duration in turns)
+  charmed: number;         // Control transfers to opponent (duration in half-turns)
+  originalColor?: PieceColor; // Remembers original color before being charmed
+  suppressed: boolean;     // Cannot use abilities/supers (ends when leaving Aura or source)
+  guarding: boolean;       // Receives redirected damage from Guarded allies
+  marked: boolean;         // Applied by Knight; next damage removes it and grants 1 Valor
+  bastionGuarded?: boolean; // Applied dynamically when within an active allied Bastion (2 tiles)
+}
+
+export interface Piece {
+  id: string;
+  type: PieceType;
+  color: PieceColor;
+  hp: number;
+  maxHp: number;
+  atk: number;
+  valor: number;           // 0 to 7 (Royals & Champions)
+  resolve: number;         // 1 to 5 (Infantry - Pawn & Guard)
+  cooldowns: {
+    ability: number;
+    passive: number;
+  };
+  conditions: Conditions;
+  hasMoved: boolean;
+  unyieldingUsed: boolean; // For Resolve 5 infantry (survive at 1 HP once per match)
+  survivedDamageThisRound?: boolean;
+  trackedStats?: number; // Used for Divine Grace (Bishop) and Guardian's Burden (Rook)
+  reached4thRank?: boolean;
+  reached2ndRank?: boolean;
+  protectedPieceId?: string;
+  bastionTurns?: number;
+}
+
+export interface Position {
+  r: number; // Row (0 to 7, where White starts at 7, Black at 0)
+  c: number; // Column (0 to 7, matching files a-h)
+}
+
+export interface GameState {
+  board: (Piece | null)[][]; // 8x8 grid
+  turn: number;              // Current turn counter
+  activeColor: PieceColor;   // 'WHITE' or 'BLACK'
+  selectedPosition: Position | null;
+  validTargets: Position[];
+  // Valid move/attack/ability targets for selected piece
+  skillRangeIndicators?: Position[];
+  activeActionType: 'MOVE' | 'ATTACK' | 'ABILITY' | 'SUPER' | null;
+  history: string[];         // Move notation records (e.g., 'Pe2-e4')
+  winner: PieceColor | null;
+  statusMessage: string;
+  isSimulating: boolean;     // For War Table (AI vs AI)
+  simulationSpeed: 1 | 2 | 3;
+  pendingPromotion?: { r: number; c: number } | null;
+  pendingEvasions?: { r: number; c: number; validJumps: Position[] }[];
+  pendingStartOfTurnPassives?: { r: number; c: number; type: PieceType }[];
+  healedAllyIdsThisTurn?: string[];
+  knightValorGainedThisTurn?: boolean;
+  specialTurnState?: 'START' | 'ACTIVE' | null;
+  setup: GameSetup;
+  graveyard: { WHITE: PieceType[], BLACK: PieceType[] };
+  matchStats?: MatchStatistics;
+  piecePerformances?: Record<string, PiecePerformance>;
+}
+
+export interface SideStats {
+  defeated: number;
+  damageDealt: number;
+  damageTaken: number;
+  damagePrevented: number;
+  healing: number;
+  valorEarned: number;
+  resolveEarned: number;
+  promotions: number;
+  supersUsed: number;
+}
+
+export interface MatchStatistics {
+  WHITE: SideStats;
+  BLACK: SideStats;
+}
+
+export interface PiecePerformance {
+  type: PieceType;
+  color: PieceColor;
+  damageDealt: number;
+  damagePrevented: number;
+  healing: number;
+  kills: number;
+  supersUsed: number;
+  score: number;
+}
+

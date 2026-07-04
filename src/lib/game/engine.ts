@@ -1,0 +1,1593 @@
+import { logMove, logAttack, logAbility, logSuper } from './logger';
+import { GameState, Position, Piece, PieceColor, Conditions, PieceType } from '../../types';
+
+// Helper to check if coordinates are on board
+export const isValidPos = (r: number, c: number) => r >= 0 && r < 8 && c >= 0 && c < 8;
+
+export const getPieceAt = (board: (Piece | null)[][], r: number, c: number) => {
+  if (!isValidPos(r, c)) return null;
+  return board[r][c];
+};
+
+export const cloneGameState = (gameState: GameState): GameState => {
+  return JSON.parse(JSON.stringify(gameState)); // Deep clone for simplicity in MVP
+};
+
+export const getValidMoves = (gameState: GameState, r: number, c: number): Position[] => {
+  const piece = getPieceAt(gameState.board, r, c);
+  if (!piece) return [];
+  
+  if (piece.conditions.frozen > 0) return [];
+  if (piece.bastionTurns && piece.bastionTurns > 0) return [];
+  
+  const moves: Position[] = [];
+  const addMove = (nr: number, nc: number) => {
+    if (isValidPos(nr, nc) && !getPieceAt(gameState.board, nr, nc)) {
+      moves.push({ r: nr, c: nc });
+      return true;
+    }
+    return false;
+  };
+
+  const isWhite = piece.color === 'WHITE';
+  const forward = isWhite ? -1 : 1;
+
+  let slideRange = 8;
+  if (piece.type === 'KING' && piece.conditions.haste) {
+    slideRange = 2;
+  }
+
+  const stepDirs = [[-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]];
+  const orthDirs = [[-1,0], [1,0], [0,-1], [0,1]];
+  const diagDirs = [[-1,-1], [-1,1], [1,-1], [1,1]];
+
+  const slide = (dirs: number[][], maxRange: number = 8) => {
+    for (const [dr, dc] of dirs) {
+      for (let i = 1; i <= maxRange; i++) {
+        if (!addMove(r + dr * i, c + dc * i)) break;
+      }
+    }
+  };
+
+  switch (piece.type) {
+    case 'KING':
+      if (piece.conditions.haste) {
+        slide([...orthDirs, ...diagDirs], 2);
+      } else {
+        stepDirs.forEach(([dr, dc]) => addMove(r + dr, c + dc));
+      }
+      break;
+    case 'ROYAL_GUARD':
+      stepDirs.forEach(([dr, dc]) => addMove(r + dr, c + dc));
+      break;
+    case 'PAWN':
+      if (addMove(r + forward, c)) {
+        if (!piece.hasMoved) {
+          addMove(r + forward * 2, c);
+        }
+      }
+      break;
+    case 'KNIGHT':
+      const knightMoves = [
+        [-2, -1], [-2, 1], [-1, -2], [-1, 2],
+        [1, -2], [1, 2], [2, -1], [2, 1]
+      ];
+      knightMoves.forEach(([dr, dc]) => addMove(r + dr, c + dc));
+      break;
+    case 'BISHOP':
+      slide(diagDirs);
+      break;
+    case 'ROOK':
+      slide(orthDirs);
+      break;
+    case 'QUEEN':
+      slide([...orthDirs, ...diagDirs]);
+      break;
+  }
+
+  return moves;
+};
+
+export const getValidAttacks = (gameState: GameState, r: number, c: number): Position[] => {
+  const piece = getPieceAt(gameState.board, r, c);
+  if (!piece) return [];
+  
+  if (piece.conditions.frozen > 0) return [];
+  if (piece.bastionTurns && piece.bastionTurns > 0) return [];
+  
+  const attacks: Position[] = [];
+  const enemyColor = piece.color === 'WHITE' ? 'BLACK' : 'WHITE';
+
+  const checkAttack = (nr: number, nc: number) => {
+    if (!isValidPos(nr, nc)) return false;
+    const target = getPieceAt(gameState.board, nr, nc);
+    if (target && target.color === enemyColor) {
+      if (target.conditions.frozen <= 0) {
+        attacks.push({ r: nr, c: nc });
+      }
+      return false; // blocked by enemy
+    }
+    if (target) return false; // blocked by ally
+    return true; // continue
+  };
+
+  const isWhite = piece.color === 'WHITE';
+  const forward = isWhite ? -1 : 1;
+  const orthDirs = [[-1,0], [1,0], [0,-1], [0,1]];
+  const diagDirs = [[-1,-1], [-1,1], [1,-1], [1,1]];
+  const stepDirs = [[-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]];
+
+  const lineOfSight = (dirs: number[][], maxRange: number = 8) => {
+    for (const [dr, dc] of dirs) {
+      for (let i = 1; i <= maxRange; i++) {
+        if (!checkAttack(r + dr * i, c + dc * i)) break;
+      }
+    }
+  };
+
+  switch (piece.type) {
+    case 'KING':
+      const kingRange = piece.conditions.haste ? 2 : 1;
+      if (kingRange === 1) {
+        stepDirs.forEach(([dr, dc]) => checkAttack(r + dr, c + dc));
+      } else {
+        for (let dr = -2; dr <= 2; dr++) {
+          for (let dc = -2; dc <= 2; dc++) {
+            if (dr === 0 && dc === 0) continue;
+            checkAttack(r + dr, c + dc);
+          }
+        }
+      }
+      break;
+    case 'ROYAL_GUARD':
+      stepDirs.forEach(([dr, dc]) => checkAttack(r + dr, c + dc));
+      break;
+    case 'PAWN':
+      checkAttack(r + forward, c - 1);
+      checkAttack(r + forward, c + 1);
+      break;
+    case 'KNIGHT':
+      const knightMoves = [
+        [-2, -1], [-2, 1], [-1, -2], [-1, 2],
+        [1, -2], [1, 2], [2, -1], [2, 1]
+      ];
+      knightMoves.forEach(([dr, dc]) => checkAttack(r + dr, c + dc));
+      break;
+    case 'BISHOP':
+      lineOfSight(diagDirs);
+      break;
+    case 'ROOK':
+      lineOfSight(orthDirs);
+      break;
+    case 'QUEEN':
+      lineOfSight([...orthDirs, ...diagDirs]);
+      break;
+  }
+
+  return attacks;
+};
+
+export const getValidAbilityTargets = (gameState: GameState, r: number, c: number, ignoreCooldownAndCharge = false): Position[] => {
+  const piece = getPieceAt(gameState.board, r, c);
+  if (!piece) return [];
+  if (piece.conditions.frozen > 0 || piece.conditions.charmed > 0 || piece.conditions.suppressed) return [];
+  if (piece.type === 'ROOK' && piece.bastionTurns !== undefined && piece.bastionTurns > 0) return [];
+  if (!ignoreCooldownAndCharge && piece.cooldowns.ability > 0) return [];
+
+  const targets: Position[] = [];
+  const addTarget = (tr: number, tc: number) => {
+    if (isValidPos(tr, tc)) {
+      const tp = getPieceAt(gameState.board, tr, tc);
+      if (tp && tp.conditions.frozen > 0) return; // cannot cast skills on frozen tiles
+      targets.push({ r: tr, c: tc });
+    }
+  };
+
+  switch (piece.type) {
+    case 'KING': // Royal Reinforcement: Adjacent empty tile
+      let rgCount = 0;
+      for (let tr = 0; tr < 8; tr++) {
+         for (let tc = 0; tc < 8; tc++) {
+            const p = gameState.board[tr][tc];
+            if (p && p.type === 'ROYAL_GUARD' && p.color === piece.color) rgCount++;
+         }
+      }
+      if (rgCount < 2) {
+        for (let dr = -1; dr <= 1; dr++) {
+          for (let dc = -1; dc <= 1; dc++) {
+            if (dr === 0 && dc === 0) continue;
+            if (isValidPos(r + dr, c + dc) && !getPieceAt(gameState.board, r + dr, c + dc)) {
+              addTarget(r + dr, c + dc);
+            }
+          }
+        }
+      }
+      break;
+    case 'QUEEN': // Cold Charm: First enemy in line of sight
+      const queenDirs = [[-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]];
+      for (const [dr, dc] of queenDirs) {
+        for (let i = 1; i <= 8; i++) {
+          const tr = r + dr * i;
+          const tc = c + dc * i;
+          if (!isValidPos(tr, tc)) break;
+          const targetPiece = getPieceAt(gameState.board, tr, tc);
+          if (targetPiece) {
+            if (targetPiece.color !== piece.color && targetPiece.type !== 'KING' && targetPiece.type !== 'QUEEN' && targetPiece.type !== 'ROYAL_GUARD') {
+              addTarget(tr, tc);
+            }
+            break;
+          }
+        }
+      }
+      break;
+    case 'ROOK': // Protect: One allied piece within 2 tiles
+      for (let tr = 0; tr < 8; tr++) {
+        for (let tc = 0; tc < 8; tc++) {
+          if (Math.abs(tr - r) <= 2 && Math.abs(tc - c) <= 2) {
+            const tp = getPieceAt(gameState.board, tr, tc);
+            if (tp && tp.color === piece.color && tp !== piece) {
+              addTarget(tr, tc);
+            }
+          }
+        }
+      }
+      break;
+    case 'BISHOP': // Divine Judgement: Ally within 2 tiles (Heal) OR first enemy in line of sight (Strike)
+      // Allies within 2 tiles
+      for (let tr = 0; tr < 8; tr++) {
+        for (let tc = 0; tc < 8; tc++) {
+          if (Math.abs(tr - r) <= 2 && Math.abs(tc - c) <= 2) {
+            const tp = getPieceAt(gameState.board, tr, tc);
+            if (tp && tp.color === piece.color && tp.hp < tp.maxHp) {
+              addTarget(tr, tc);
+            }
+          }
+        }
+      }
+      // Enemy in LOS (diag)
+      const bishopDirs = [[-1,-1], [-1,1], [1,-1], [1,1]];
+      for (const [dr, dc] of bishopDirs) {
+        for (let i = 1; i <= 8; i++) {
+          const tr = r + dr * i;
+          const tc = c + dc * i;
+          if (!isValidPos(tr, tc)) break;
+          const targetPiece = getPieceAt(gameState.board, tr, tc);
+          if (targetPiece) {
+            if (targetPiece.color !== piece.color) addTarget(tr, tc);
+            break;
+          }
+        }
+      }
+      break;
+    case 'KNIGHT': // Charge: One legal Knight destination
+      const knightMoves = [[-2, -1], [-2, 1], [-1, -2], [-1, 2], [1, -2], [1, 2], [2, -1], [2, 1]];
+      knightMoves.forEach(([dr, dc]) => {
+        const tr = r + dr;
+        const tc = c + dc;
+        if (isValidPos(tr, tc)) {
+          const tp = getPieceAt(gameState.board, tr, tc);
+          // Can target empty or enemy
+          if (!tp || tp.color !== piece.color) {
+            addTarget(tr, tc);
+          }
+        }
+      });
+      break;
+    case 'PAWN': // Brace: Self-target (could represent as the pawn's own square)
+      addTarget(r, c);
+      break;
+    case 'ROYAL_GUARD':
+      // No ability
+      break;
+  }
+
+  return targets;
+};
+
+export const getValidSuperTargets = (gameState: GameState, r: number, c: number, ignoreCooldownAndCharge = false): Position[] => {
+  const piece = getPieceAt(gameState.board, r, c);
+  if (!piece) return [];
+  if (piece.conditions.frozen > 0 || piece.conditions.charmed > 0 || piece.conditions.suppressed) return [];
+  const isInfantry = piece.type === 'PAWN' || piece.type === 'ROYAL_GUARD';
+  const currentProgression = isInfantry ? piece.resolve : piece.valor;
+  const maxProgression = isInfantry ? 5 : 7;
+  if (!ignoreCooldownAndCharge && currentProgression < maxProgression) return [];
+
+  const targets: Position[] = [];
+  const addTarget = (tr: number, tc: number) => {
+    if (isValidPos(tr, tc)) {
+      const tp = getPieceAt(gameState.board, tr, tc);
+      if (tp && tp.conditions.frozen > 0) return; // cannot cast skills on frozen tiles
+      targets.push({ r: tr, c: tc });
+    }
+  };
+
+  switch (piece.type) {
+    case 'KING': // King's Command: Self-target
+    case 'ROOK': // Bastion: Self-target
+      addTarget(r, c);
+      break;
+    case 'QUEEN': // Ice Palace: Any enemy in chosen line of sight (even behind other pieces)
+      const queenDirs = [[-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]];
+      for (const [dr, dc] of queenDirs) {
+        for (let i = 1; i <= 8; i++) {
+          const tr = r + dr * i;
+          const tc = c + dc * i;
+          if (!isValidPos(tr, tc)) break;
+          const targetPiece = getPieceAt(gameState.board, tr, tc);
+          if (targetPiece) {
+            if (targetPiece.color !== piece.color && targetPiece.type !== 'KING') {
+              addTarget(tr, tc);
+            }
+          }
+        }
+      }
+      break;
+    case 'BISHOP': // Resurrection: Revive allied piece on empty square of back rank
+      const backRank = piece.color === 'WHITE' ? 7 : 0;
+      if (gameState.graveyard[piece.color].filter(t => t !== 'KING' && t !== 'ROYAL_GUARD').length > 0) {
+        for (let c = 0; c < 8; c++) {
+          if (!getPieceAt(gameState.board, backRank, c)) {
+            addTarget(backRank, c);
+          }
+        }
+      }
+      break;
+    case 'KNIGHT': // Lethal Pounce: Non-King enemy on legal Knight destination
+      const knightMoves = [[-2, -1], [-2, 1], [-1, -2], [-1, 2], [1, -2], [1, 2], [2, -1], [2, 1]];
+      knightMoves.forEach(([dr, dc]) => {
+        const tr = r + dr;
+        const tc = c + dc;
+        const tp = getPieceAt(gameState.board, tr, tc);
+        if (tp && tp.color !== piece.color && tp.type !== 'KING') {
+          addTarget(tr, tc);
+        }
+      });
+      break;
+  }
+  return targets;
+};
+
+export const getSkillRangeIndicators = (gameState: GameState, r: number, c: number, actionType: 'ABILITY' | 'SUPER'): Position[] => {
+  const piece = getPieceAt(gameState.board, r, c);
+  if (!piece) return [];
+  const indicators: Position[] = [];
+  const addIndicator = (tr: number, tc: number) => {
+    if (isValidPos(tr, tc)) indicators.push({ r: tr, c: tc });
+  };
+  
+  if (actionType === 'ABILITY') {
+    switch (piece.type) {
+      case 'KING':
+        for (let dr = -1; dr <= 1; dr++) {
+          for (let dc = -1; dc <= 1; dc++) {
+            addIndicator(r + dr, c + dc);
+          }
+        }
+        break;
+      case 'QUEEN':
+        const queenDirs = [[-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]];
+        for (const [dr, dc] of queenDirs) {
+          for (let i = 1; i <= 8; i++) {
+            const tr = r + dr * i;
+            const tc = c + dc * i;
+            if (!isValidPos(tr, tc)) break;
+            addIndicator(tr, tc);
+            if (getPieceAt(gameState.board, tr, tc)) break;
+          }
+        }
+        break;
+      case 'ROOK':
+        for (let tr = 0; tr < 8; tr++) {
+          for (let tc = 0; tc < 8; tc++) {
+            if (Math.abs(tr - r) <= 2 && Math.abs(tc - c) <= 2) {
+              addIndicator(tr, tc);
+            }
+          }
+        }
+        break;
+      case 'BISHOP':
+        // 5x5 area
+        for (let tr = 0; tr < 8; tr++) {
+          for (let tc = 0; tc < 8; tc++) {
+            if (Math.abs(tr - r) <= 2 && Math.abs(tc - c) <= 2) {
+              addIndicator(tr, tc);
+            }
+          }
+        }
+        // Diagonals
+        const bishopDirs = [[-1,-1], [-1,1], [1,-1], [1,1]];
+        for (const [dr, dc] of bishopDirs) {
+          for (let i = 1; i <= 8; i++) {
+            const tr = r + dr * i;
+            const tc = c + dc * i;
+            if (!isValidPos(tr, tc)) break;
+            if (Math.abs(tr - r) > 2 || Math.abs(tc - c) > 2) {
+              addIndicator(tr, tc);
+            }
+            if (getPieceAt(gameState.board, tr, tc)) break;
+          }
+        }
+        break;
+      case 'KNIGHT':
+        const knightMoves = [[-2, -1], [-2, 1], [-1, -2], [-1, 2], [1, -2], [1, 2], [2, -1], [2, 1]];
+        knightMoves.forEach(([dr, dc]) => addIndicator(r + dr, c + dc));
+        break;
+      case 'PAWN':
+        addIndicator(r, c);
+        break;
+    }
+  } else if (actionType === 'SUPER') {
+    switch (piece.type) {
+      case 'KING':
+        addIndicator(r, c);
+        break;
+      case 'QUEEN':
+        const queenDirs = [[-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]];
+        for (const [dr, dc] of queenDirs) {
+          for (let i = 1; i <= 8; i++) {
+            const tr = r + dr * i;
+            const tc = c + dc * i;
+            if (!isValidPos(tr, tc)) break;
+            addIndicator(tr, tc);
+          }
+        }
+        break;
+      case 'ROOK':
+        for (let tr = 0; tr < 8; tr++) {
+          for (let tc = 0; tc < 8; tc++) {
+            if (Math.abs(tr - r) <= 2 && Math.abs(tc - c) <= 2) {
+              addIndicator(tr, tc);
+            }
+          }
+        }
+        break;
+      case 'BISHOP':
+        const backRank = piece.color === 'WHITE' ? 7 : 0;
+        for (let tc = 0; tc < 8; tc++) addIndicator(backRank, tc);
+        break;
+      case 'KNIGHT':
+        const knightMoves = [[-2, -1], [-2, 1], [-1, -2], [-1, 2], [1, -2], [1, 2], [2, -1], [2, 1]];
+        knightMoves.forEach(([dr, dc]) => addIndicator(r + dr, c + dc));
+        break;
+    }
+  }
+  return indicators;
+};
+
+// --- Combat Resolution ---
+export const resolveDamage = (gameState: GameState, targetR: number, targetC: number, damage: number, sourcePiece: Piece): boolean => {
+  const target = getPieceAt(gameState.board, targetR, targetC);
+  if (!target) return false;
+
+  let remainingDamage = damage;
+
+  // 1. Shielded (Blocks all damage, bypasses the minimum 1 rule)
+  if (remainingDamage > 0 && target.conditions.shielded) {
+    target.conditions.shielded = false;
+    if (target.type === 'ROOK') {
+      target.cooldowns.passive = 5;
+      trackStat(target, remainingDamage, gameState);
+    }
+    remainingDamage = 0;
+  }
+
+  // 2. Guarded and 3. Armored (Subject to minimum 1 damage rule)
+  if (remainingDamage > 0) {
+    const maxReduction = Math.max(0, remainingDamage - 1);
+    let totalReductionUsed = 0;
+
+    // --- 2. Guarded ---
+    let royalGuardPrevent = 0;
+    let activeRoyalGuard = null;
+    if (target.type === 'KING') {
+      const dirs = [[-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]];
+      dirs.forEach(([dr, dc]) => {
+        const nr = targetR + dr, nc = targetC + dc;
+        if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+          const rg = gameState.board[nr][nc];
+          if (rg && rg.color === target.color && rg.type === 'ROYAL_GUARD' && !activeRoyalGuard) {
+            royalGuardPrevent = 1;
+            activeRoyalGuard = { p: rg, r: nr, c: nc };
+          }
+        }
+      });
+    }
+
+
+    let protectPrevent = 0;
+    let protectingRooks: { p: Piece, r: number, c: number }[] = [];
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const p = gameState.board[r][c];
+        if (p && p.type === 'ROOK' && p.color === target.color && p.protectedPieceId === target.id) {
+          protectingRooks.push({ p, r, c });
+          protectPrevent += 2; // Each protect gives 2 guarded
+        }
+      }
+    }
+
+    const totalGuarded = target.conditions.guarded + royalGuardPrevent;
+    
+    if (totalGuarded > 0) {
+      const availableReduction = maxReduction - totalReductionUsed;
+      const prevented = Math.min(availableReduction, totalGuarded);
+      
+      if (prevented > 0) {
+        totalReductionUsed += prevented;
+        
+        let toRemoveFromConditions = prevented;
+        if (royalGuardPrevent > 0) {
+          toRemoveFromConditions = Math.max(0, toRemoveFromConditions - 1);
+        }
+        if (protectPrevent > 0) {
+          toRemoveFromConditions = Math.max(0, toRemoveFromConditions - protectPrevent);
+        }
+        target.conditions.guarded -= toRemoveFromConditions;
+        target.conditions.guarded = Math.max(0, target.conditions.guarded); // Safety clamp
+
+        // Redirect to Guarding piece
+        const guardingPieces: { p: Piece, r: number, c: number }[] = [];
+        if (activeRoyalGuard && royalGuardPrevent > 0) {
+           guardingPieces.push(activeRoyalGuard);
+        }
+        
+        for (let r = 0; r < 8; r++) {
+          for (let c = 0; c < 8; c++) {
+            const p = gameState.board[r][c];
+            if (p && p.color === target.color && p.conditions.guarding && p.type !== 'ROYAL_GUARD') {
+              // Don't push a Rook if it's already pushed from activeBastionRooks
+              const isAlreadyAdded = guardingPieces.some(gp => gp.p.id === p.id);
+              if (!isAlreadyAdded) {
+                guardingPieces.push({ p, r, c });
+              }
+            }
+          }
+        }
+
+        if (guardingPieces.length > 0) {
+          const splitDamage = Math.floor(prevented / guardingPieces.length);
+          let remainder = prevented % guardingPieces.length;
+          guardingPieces.forEach((gp) => {
+            let dmg = splitDamage + (remainder > 0 ? 1 : 0);
+            if (remainder > 0) remainder--;
+            
+            if (gp.p.conditions.shielded && dmg > 0) {
+              gp.p.conditions.shielded = false;
+              if (gp.p.type === 'ROOK') {
+                gp.p.cooldowns.passive = 5;
+                trackStat(gp.p, dmg, gameState);
+              }
+              dmg = 0;
+            }
+
+            gp.p.hp -= dmg;
+            if (gp.p.type === 'ROOK') {
+              trackStat(gp.p, dmg, gameState);
+            }
+
+            if (gp.p.hp <= 0) {
+              if (gp.p.resolve === 5 && !gp.p.unyieldingUsed) {
+                gp.p.hp = 1;
+                gp.p.unyieldingUsed = true;
+              } else {
+                const graveColor = gp.p.conditions.originalColor || gp.p.color;
+                gameState.graveyard[graveColor].push(gp.p.type);
+                
+                if (gp.p.type === 'ROOK' && gp.p.protectedPieceId) {
+                  const targetId = gp.p.protectedPieceId;
+                  for (let tr = 0; tr < 8; tr++) {
+                    for (let tc = 0; tc < 8; tc++) {
+                      const targetPiece = gameState.board[tr][tc];
+                      if (targetPiece && targetPiece.id === targetId) {
+                        targetPiece.conditions.guarded = Math.max(0, targetPiece.conditions.guarded - 2);
+                      }
+                    }
+                  }
+                }
+                
+                gameState.board[gp.r][gp.c] = null;
+              }
+            }
+          });
+        }
+      }
+    }
+
+    // --- 3. Armored ---
+    if (target.conditions.armored > 0) {
+      const availableReduction = maxReduction - totalReductionUsed;
+      const preventedArmor = Math.min(availableReduction, target.conditions.armored);
+      if (preventedArmor > 0) {
+        totalReductionUsed += preventedArmor;
+        if (target.type === 'ROOK') {
+          trackStat(target, preventedArmor, gameState);
+        }
+      }
+    }
+
+    // Apply the total allowed reductions
+    remainingDamage -= totalReductionUsed;
+  }
+
+  // 4. Remaining Damage
+  if (remainingDamage > 0) {
+    target.hp -= remainingDamage;
+
+    if (sourcePiece.type === 'KNIGHT') {
+      if (target.conditions.marked) {
+        target.conditions.marked = false;
+        sourcePiece.valor = Math.min(7, sourcePiece.valor + 1);
+        gameState.knightValorGainedThisTurn = true;
+        
+        // Remove all other marks on the board
+        for (let row = 0; row < 8; row++) {
+          for (let col = 0; col < 8; col++) {
+            const tp = gameState.board[row][col];
+            if (tp && tp.conditions.marked) {
+              tp.conditions.marked = false;
+            }
+          }
+        }
+        
+        gameState.history.push(`<P>Grand Paladin's</P> <A>Relentless Pursuit</A> triggered, gaining <V>1 Valor</V>. All other marks vanished.`);
+      } else {
+        if (!gameState.knightValorGainedThisTurn) {
+          target.conditions.marked = true;
+        }
+      }
+    }
+
+    if (target.type === 'KING' && target.hp <= target.maxHp * 0.25 && !target.unyieldingUsed) {
+      target.unyieldingUsed = true;
+      target.conditions.empowered += 6;
+      target.conditions.haste = true;
+      target.cooldowns.passive = 3;
+      gameState.history.push(`<SUPER><P>King's</P> <A>Last Stand</A> awakened, refusing defeat!</SUPER>`);
+    }
+  }
+
+  // Check if defeated
+  if (target.hp <= 0) {
+    // Unyielding check
+    if (target.resolve === 5 && !target.unyieldingUsed) {
+      target.hp = 1;
+      target.unyieldingUsed = true;
+    } else {
+      const graveColor = target.conditions.originalColor || target.color;
+      gameState.graveyard[graveColor].push(target.type);
+      
+      if (target.type === 'ROOK' && target.protectedPieceId) {
+        const targetId = target.protectedPieceId;
+        for (let tr = 0; tr < 8; tr++) {
+          for (let tc = 0; tc < 8; tc++) {
+            const targetPiece = gameState.board[tr][tc];
+            if (targetPiece && targetPiece.id === targetId) {
+              targetPiece.conditions.guarded = Math.max(0, targetPiece.conditions.guarded - 2);
+            }
+          }
+        }
+      }
+
+      // If the defeated piece was guarded by a Rook, clear that Rook's protection
+      for (let tr = 0; tr < 8; tr++) {
+        for (let tc = 0; tc < 8; tc++) {
+          const p = gameState.board[tr][tc];
+          if (p && p.type === 'ROOK' && p.protectedPieceId === target.id) {
+            delete p.protectedPieceId;
+            p.conditions.guarding = false;
+          }
+        }
+      }
+
+      gameState.board[targetR][targetC] = null;
+      
+      // Progression on kill
+      if (['KING', 'QUEEN', 'ROOK', 'KNIGHT', 'BISHOP'].includes(sourcePiece.type)) {
+        sourcePiece.valor = (sourcePiece.valor + 1);
+      } else if (['PAWN', 'ROYAL_GUARD'].includes(sourcePiece.type)) {
+        gainResolve(sourcePiece, 1);
+      }
+      
+      // Royal Presence
+      for (let r = 0; r < 8; r++) {
+         for (let c = 0; c < 8; c++) {
+            const p = gameState.board[r][c];
+            if (p && p.color === sourcePiece.color && ['KING', 'QUEEN'].includes(p.type)) {
+               if (Math.abs(r - targetR) <= 2 && Math.abs(c - targetC) <= 2) {
+                  p.valor = (p.valor + 1);
+               }
+            }
+         }
+      }
+      return true; // defeated
+    }
+  }
+
+  // Survivor's Resolve & Undying King
+  if (remainingDamage > 0 && !target.survivedDamageThisRound) {
+    target.survivedDamageThisRound = true;
+    if (target.type === 'KING') {
+      target.valor = (target.valor + 1);
+      gameState.history.push(`<P>King</P> gained <V>1 Valor</V> from <A>Undying King</A>.`);
+    } else if (['PAWN', 'ROYAL_GUARD'].includes(target.type)) {
+      gainResolve(target, 1);
+      gameState.history.push(`<P>${target.type === 'PAWN' ? 'Soldier' : 'Guard'}</P> gained <V>1 Resolve</V> from <A>Survivor's Resolve</A>.`);
+    }
+  }
+
+  // Tactical Evasion
+  if (target.type === 'KNIGHT' && target.cooldowns.passive === 0) {
+    // Find a valid empty square for knight jump
+    const knightDirs = [[-2, -1], [-2, 1], [-1, -2], [-1, 2], [1, -2], [1, 2], [2, -1], [2, 1]];
+    const validJumps = [];
+    for (const [dr, dc] of knightDirs) {
+      const nr = targetR + dr, nc = targetC + dc;
+      if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+        if (!gameState.board[nr][nc]) {
+          validJumps.push({ r: nr, c: nc });
+        }
+      }
+    }
+    if (validJumps.length > 0) {
+      target.cooldowns.passive = 3;
+      const playerType = gameState.setup[target.color === 'WHITE' ? 'playerWhite' : 'playerBlack'];
+      if (playerType === 'HUMAN') {
+        if (!gameState.pendingEvasions) gameState.pendingEvasions = [];
+        gameState.pendingEvasions.push({ r: targetR, c: targetC, validJumps });
+      } else {
+        const jump = validJumps[Math.floor(Math.random() * validJumps.length)];
+        gameState.board[jump.r][jump.c] = target;
+        gameState.board[targetR][targetC] = null;
+        gameState.history.push(`<P>Grand Paladin's</P> <A>Tactical Evasion</A> triggered, leaping to safety!`);
+      }
+    }
+  }
+
+  return false; // survived
+};
+
+export const syncBastionGuardedState = (gameState: GameState) => {
+  // 1. Synchronize Royal Guard guarding state (must be adjacent to King)
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = gameState.board[r][c];
+      if (p && p.type === 'ROYAL_GUARD') {
+        const dirs = [[-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]];
+        let adjacentKing = false;
+        dirs.forEach(([dr, dc]) => {
+          const nr = r + dr, nc = c + dc;
+          if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+            const target = gameState.board[nr][nc];
+            if (target && target.color === p.color && target.type === 'KING') {
+              adjacentKing = true;
+            }
+          }
+        });
+        p.conditions.guarding = adjacentKing;
+      }
+    }
+  }
+
+  // 2. Synchronize Rook's guarding state in bastion form
+  // (Only considered guarding if there's at least one ally inside bastion's 2-tile range)
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = gameState.board[r][c];
+      if (p && p.type === 'ROOK' && p.bastionTurns !== undefined && p.bastionTurns > 0) {
+        let hasAllyInRange = false;
+        for (let tr = 0; tr < 8; tr++) {
+          for (let tc = 0; tc < 8; tc++) {
+            const ally = gameState.board[tr][tc];
+            if (ally && ally.color === p.color && ally.id !== p.id) {
+              if (Math.abs(tr - r) <= 2 && Math.abs(tc - c) <= 2) {
+                hasAllyInRange = true;
+                break;
+              }
+            }
+          }
+          if (hasAllyInRange) break;
+        }
+        p.conditions.guarding = hasAllyInRange;
+      }
+    }
+  }
+};
+
+export const updateAuras = (gameState: GameState) => {
+  const royals = ['KING', 'QUEEN', 'ROYAL_GUARD'];
+
+  // Reset auras first
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = gameState.board[r][c];
+      if (p) {
+        p.conditions.suppressed = false;
+        if (p.conditions.charmed > 0) p.conditions.suppressed = true;
+        if (p.type === 'ROYAL_GUARD') {
+          p.conditions.guarding = false;
+        }
+        // We do not blindly reset `guarded` because Rook's Protect gives guarded stacks.
+        // We will just dynamically count adjacent RGs for Kings instead.
+        // Actually, we'll store RG's contribution in a separate flag or recalculate it.
+        // For simplicity, we just add 1 guarded if not already there, but wait...
+        // Let's just track `royalGuarded` on the King if we wanted.
+        // Or we just recalculate from scratch? No, `guarded` acts as HP.
+        // It's easier to just apply the aura in `resolveDamage` directly!
+      }
+    }
+  }
+
+  // QUEEN: Sovereign Aura
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const q = gameState.board[r][c];
+      if (q && q.type === 'QUEEN' && q.conditions.charmed === 0) {
+        const dirs = [[-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]];
+        dirs.forEach(([dr, dc]) => {
+          const nr = r + dr, nc = c + dc;
+          if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+            const target = gameState.board[nr][nc];
+            if (target && target.color !== q.color && !royals.includes(target.type)) {
+              target.conditions.suppressed = true;
+            }
+          }
+        });
+      }
+      
+      // ROYAL_GUARD: Royal Protection
+      if (q && q.type === 'ROYAL_GUARD') {
+        const dirs = [[-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]];
+        let adjacentKing = false;
+        dirs.forEach(([dr, dc]) => {
+          const nr = r + dr, nc = c + dc;
+          if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+            const target = gameState.board[nr][nc];
+            if (target && target.color === q.color && target.type === 'KING') {
+              adjacentKing = true;
+            }
+          }
+        });
+        if (adjacentKing) {
+          q.conditions.guarding = true;
+        }
+      }
+    }
+  }
+
+  syncBastionGuardedState(gameState);
+};
+
+export const trackStat = (piece: Piece, amount: number, gameState: GameState) => {
+  if (piece.trackedStats === undefined) piece.trackedStats = 0;
+  piece.trackedStats += amount;
+  if (piece.trackedStats >= 6) {
+    const valorsToGain = Math.floor(piece.trackedStats / 6);
+    piece.trackedStats = piece.trackedStats % 6;
+    piece.valor = (piece.valor + valorsToGain);
+    if (piece.type === 'ROOK') {
+      gameState.history.push(`<P>Iron Bastion</P> gained <V>${valorsToGain} Valor</V> from <A>Guardian's Burden</A>.`);
+    } else if (piece.type === 'BISHOP') {
+      gameState.history.push(`<P>High Cleric</P> gained <V>${valorsToGain} Valor</V> from <A>Divine Grace</A>.`);
+    }
+  }
+};
+
+export const gainResolve = (piece: Piece, amount: number) => {
+  if (!['PAWN', 'ROYAL_GUARD'].includes(piece.type)) return;
+  const oldResolve = piece.resolve;
+  piece.resolve = (piece.resolve + amount);
+  if (oldResolve < 2 && piece.resolve >= 2) piece.atk += 1;
+  if (oldResolve < 3 && piece.resolve >= 3) { piece.maxHp += 1; piece.hp += 1; }
+  if (oldResolve < 4 && piece.resolve >= 4) piece.atk += 1;
+};
+
+export const executeAbility = (gameState: GameState, from: Position, to: Position): GameState => {
+  const nextState = cloneGameState(gameState);
+  const caster = nextState.board[from.r][from.c];
+  if (!caster) return nextState;
+
+  let affectedTarget = false;
+
+  switch (caster.type) {
+    case 'KING': // Royal Reinforcement: Summon Guard
+      nextState.board[to.r][to.c] = {
+        id: Math.random().toString(36).substr(2, 9),
+        type: 'ROYAL_GUARD',
+        color: caster.color,
+        hp: 4,
+        maxHp: 4,
+        atk: 2,
+        hasMoved: false,
+        cooldowns: { ability: 0, passive: 0 },
+        conditions: {
+          shielded: true, // Bulwark: Shielded on summon
+          armored: 0,
+          guarded: 0,
+          empowered: 0,
+          haste: false,
+          frozen: 0,
+          charmed: 0,
+          suppressed: false,
+          guarding: false,
+          marked: false,
+        },
+        valor: 0,
+        resolve: 0,
+        unyieldingUsed: false,
+      };
+      affectedTarget = true;
+      const notation = logAbility(nextState.turn, caster, 'Royal Reinforcement', 'summoning a Guard');
+      nextState.history.push(notation);
+      break;
+    case 'QUEEN': // Cold Charm
+      const qTarget = nextState.board[to.r][to.c];
+      if (qTarget && qTarget.type !== 'KING' && qTarget.type !== 'QUEEN' && qTarget.type !== 'ROYAL_GUARD') {
+        qTarget.conditions.charmed = 2; // 2 half-turns (reverts at the start of charmer's next turn)
+        qTarget.conditions.originalColor = qTarget.color;
+        qTarget.color = caster.color;
+        affectedTarget = true;
+        const notation = logAbility(nextState.turn, caster, 'Cold Charm', 'turning an enemy against its allies');
+        nextState.history.push(notation);
+      }
+      break;
+    case 'ROOK': // Protect
+      const rTarget = nextState.board[to.r][to.c];
+      if (rTarget) {
+        if (caster.protectedPieceId) {
+          for (let row = 0; row < 8; row++) {
+            for (let col = 0; col < 8; col++) {
+              const oldTarget = nextState.board[row][col];
+              if (oldTarget && oldTarget.id === caster.protectedPieceId) {
+                oldTarget.conditions.guarded = Math.max(0, oldTarget.conditions.guarded - 2);
+              }
+            }
+          }
+        }
+        rTarget.conditions.guarded += 2;
+        caster.conditions.guarding = true;
+        caster.protectedPieceId = rTarget.id;
+        affectedTarget = true;
+        const notation = logAbility(nextState.turn, caster, 'Protect', 'shielding an ally');
+        nextState.history.push(notation);
+      }
+      break;
+    case 'BISHOP': // Divine Judgement (Heal or Strike)
+      const bTarget = nextState.board[to.r][to.c];
+      if (bTarget) {
+        if (bTarget.color === caster.color) {
+          const healAmount = Math.min(3, bTarget.maxHp - bTarget.hp);
+          bTarget.hp += healAmount;
+          trackStat(caster, healAmount, nextState);
+          const notation = logAbility(nextState.turn, caster, 'Divine Judgement', `restoring <V>${healAmount} HP</V> to an ally`);
+          nextState.history.push(notation);
+        } else {
+          resolveDamage(nextState, to.r, to.c, 3, caster);
+          trackStat(caster, 3, nextState);
+          const notation = logAbility(nextState.turn, caster, 'Divine Judgement', 'striking an enemy for <V>3 damage</V>');
+          nextState.history.push(notation);
+        }
+        affectedTarget = true;
+      }
+      break;
+    case 'KNIGHT': // Charge
+      const nTarget = nextState.board[to.r][to.c];
+      if (nTarget && nTarget.color !== caster.color) {
+        const damage = 4;
+        const defeated = resolveDamage(nextState, to.r, to.c, damage, caster);
+        if (defeated) {
+          nextState.board[to.r][to.c] = caster;
+          nextState.board[from.r][from.c] = null;
+        }
+      } else if (!nTarget) {
+        // Leap to empty
+        nextState.board[to.r][to.c] = caster;
+        nextState.board[from.r][from.c] = null;
+      }
+      // Splash damage
+      let splashed = false;
+      const dirs = [[-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]];
+      dirs.forEach(([dr, dc]) => {
+        const sr = to.r + dr;
+        const sc = to.c + dc;
+        if (isValidPos(sr, sc)) {
+          const sp = nextState.board[sr][sc];
+          if (sp && sp.color !== caster.color) {
+            resolveDamage(nextState, sr, sc, 2, caster);
+            splashed = true;
+          }
+        }
+      });
+      const chargeNotation = logAbility(nextState.turn, caster, 'Charge', splashed ? 'crashing into the enemy and striking nearby foes' : 'leaping into the fray');
+      nextState.history.push(chargeNotation);
+      affectedTarget = true;
+      break;
+    case 'PAWN': // Brace
+      caster.conditions.shielded = true;
+      affectedTarget = true;
+      const braceNotation = logAbility(nextState.turn, caster, 'Brace', 'fortifying its position');
+      nextState.history.push(braceNotation);
+      break;
+  }
+
+  // Sworn Duty for Champions (Valor)
+  if (affectedTarget && ['BISHOP', 'KNIGHT', 'ROOK'].includes(caster.type)) {
+    caster.valor = (caster.valor + 1);
+  }
+
+  // Set ability cooldown based on rulebook
+  const cooldowns: Record<PieceType, number> = {
+    KING: 5, QUEEN: 3, ROOK: 3, KNIGHT: 3, BISHOP: 3, PAWN: 2, ROYAL_GUARD: 0
+  };
+  caster.cooldowns.ability = cooldowns[caster.type] || 0;
+
+  caster.hasMoved = true;
+  nextState.selectedPosition = null;
+  nextState.validTargets = [];
+  nextState.skillRangeIndicators = [];
+  nextState.activeActionType = null;
+  
+  return endTurn(nextState);
+};
+
+export const executeSuper = (gameState: GameState, from: Position, to: Position, specificPieceType?: PieceType): GameState => {
+  const nextState = cloneGameState(gameState);
+  const caster = nextState.board[from.r][from.c];
+  if (!caster) return nextState;
+
+  switch (caster.type) {
+    case 'KING': // King's Command
+      nextState.specialTurnState = 'START';
+      nextState.history.push(logSuper(nextState.turn, caster, "King's Command", "seizing another turn before the enemy could answer"));
+      break;
+    case 'QUEEN': // Ice Palace
+      const dr = Math.sign(to.r - from.r);
+      const dc = Math.sign(to.c - from.c);
+      if (dr !== 0 || dc !== 0) {
+        for (let i = 1; i <= 8; i++) {
+          const tr = from.r + dr * i;
+          const tc = from.c + dc * i;
+          if (!isValidPos(tr, tc)) break;
+          const tp = nextState.board[tr][tc];
+          if (tp && tp.color !== caster.color && tp.type !== 'KING') {
+            tp.conditions.frozen = 3; // Frozen lasts 2 of affected player's active turns
+          }
+        }
+      }
+      nextState.history.push(logSuper(nextState.turn, caster, "Ice Palace", "freezing her enemies beneath a kingdom of frost"));
+      break;
+    case 'ROOK': // Bastion
+      caster.conditions.guarding = true;
+      caster.conditions.armored += 1;
+      caster.bastionTurns = 3;
+      for (let tr = 0; tr < 8; tr++) {
+        for (let tc = 0; tc < 8; tc++) {
+          const ally = nextState.board[tr][tc];
+          if (ally && ally.color === caster.color && ally.id !== caster.id) {
+            if (Math.max(Math.abs(tr - from.r), Math.abs(tc - from.c)) <= 2) {
+              ally.conditions.guarded += 2;
+            }
+          }
+        }
+      }
+      nextState.history.push(logSuper(nextState.turn, caster, "Bastion", "becoming an unbreakable iron bastion and shielding the kingdom"));
+      break;
+    case 'BISHOP': // Resurrection
+      const deadAllies = nextState.graveyard[caster.color].filter(t => t !== 'KING' && t !== 'ROYAL_GUARD');
+      if (deadAllies.length > 0) {
+        let revivedType: PieceType;
+        if (specificPieceType && (deadAllies as PieceType[]).includes(specificPieceType)) {
+          revivedType = specificPieceType;
+        } else {
+          revivedType = deadAllies[deadAllies.length - 1];
+        }
+
+        // Remove it from the actual graveyard array
+        const idx = nextState.graveyard[caster.color].indexOf(revivedType);
+        if (idx !== -1) {
+          nextState.graveyard[caster.color].splice(idx, 1);
+        }
+        
+        // Find maxHp based on type (rough lookup)
+        const hpMap: Record<string, number> = {
+          QUEEN: 9, ROOK: 10, KNIGHT: 8, BISHOP: 8, PAWN: 3
+        };
+        const maxHp = hpMap[revivedType] || 5;
+
+        nextState.board[to.r][to.c] = {
+          id: Math.random().toString(36).substr(2, 9),
+          type: revivedType,
+          color: caster.color,
+          hp: Math.ceil(maxHp / 2),
+          maxHp: maxHp,
+          atk: revivedType === 'QUEEN' ? 4 : revivedType === 'ROOK' ? 4 : revivedType === 'PAWN' ? 2 : 3,
+          hasMoved: false,
+          cooldowns: { ability: 0, passive: 0 },
+          conditions: {
+            shielded: false,
+            armored: 0,
+            guarded: 0,
+            empowered: 0,
+            haste: false,
+            frozen: 0,
+            charmed: 0,
+            suppressed: false,
+            guarding: false,
+            marked: false,
+          },
+          valor: 0,
+          resolve: 0,
+          unyieldingUsed: false,
+        };
+      }
+      nextState.history.push(logSuper(nextState.turn, caster, "Resurrection", "returning a fallen champion to the battlefield"));
+      break;
+    case 'KNIGHT': // Lethal Pounce
+      const tp = nextState.board[to.r][to.c];
+      if (tp && tp.type !== 'KING') {
+        const graveColor = tp.conditions.originalColor || tp.color;
+        nextState.graveyard[graveColor].push(tp.type);
+        nextState.board[to.r][to.c] = caster;
+        nextState.board[from.r][from.c] = null;
+        nextState.history.push(logSuper(nextState.turn, caster, "Lethal Pounce", "ending an enemy with absolute conviction"));
+      }
+      break;
+  }
+
+  // Using a Super immediately resets Valor to 0. (Infantry never gain Supers)
+  caster.valor = 0;
+
+  caster.hasMoved = true;
+  nextState.selectedPosition = null;
+  nextState.validTargets = [];
+  nextState.skillRangeIndicators = [];
+  nextState.activeActionType = null;
+  
+  return endTurn(nextState);
+};
+export const executeMove = (gameState: GameState, from: Position, to: Position, aiPromotionType?: PieceType): GameState => {
+  const nextState = cloneGameState(gameState);
+  const piece = nextState.board[from.r][from.c];
+  if (!piece) return nextState;
+
+  nextState.board[to.r][to.c] = piece;
+  nextState.board[from.r][from.c] = null;
+  piece.hasMoved = true;
+  
+  // Vanguard's Resolve & Promotion
+  if (piece.type === 'PAWN') {
+    const enemyBackRank = piece.color === 'WHITE' ? 0 : 7;
+    const distanceToBackRank = Math.abs(to.r - enemyBackRank);
+    if (distanceToBackRank <= 3 && !piece.reached4thRank) { // 4th rank is dist 3
+      piece.reached4thRank = true;
+      gainResolve(piece, 1);
+    }
+    if (distanceToBackRank <= 1 && !piece.reached2ndRank) { // 2nd rank is dist 1
+      piece.reached2ndRank = true;
+      gainResolve(piece, 1);
+    }
+    
+    // Vanguard's Resolve & Promotion
+    if (distanceToBackRank === 0) {
+      const playerType = nextState.setup[piece.color === 'WHITE' ? 'playerWhite' : 'playerBlack'];
+      if (playerType === 'HUMAN') {
+         nextState.pendingPromotion = { r: to.r, c: to.c };
+      } else {
+         const promoType = aiPromotionType || 'ROOK';
+         piece.type = promoType;
+         piece.valor = 0;
+         let baseHp = 10;
+         let baseAtk = 4;
+         let pieceName = 'Iron Bastion';
+         if (promoType === 'KNIGHT') { baseHp = 8; baseAtk = 3; pieceName = 'Grand Paladin'; }
+         else if (promoType === 'BISHOP') { baseHp = 8; baseAtk = 3; pieceName = 'High Inquisitor'; }
+         piece.maxHp = baseHp + (piece.resolve >= 3 ? 1 : 0);
+         piece.hp = piece.maxHp;
+         piece.atk = baseAtk + (piece.resolve >= 2 ? 1 : 0) + (piece.resolve >= 4 ? 1 : 0);
+         piece.cooldowns.ability = 0;
+         piece.cooldowns.passive = 0;
+         nextState.history.push(`<T>T${nextState.turn}.</T> <P>Soldier</P> has reached the end and promoted to <A>${pieceName}</A>!`);
+      }
+    }
+  }
+
+  // Note: we can format notation later, e.g., Pe2-e4
+  const notation = logMove(nextState.turn, piece, to);
+  nextState.history.push(notation);
+
+  nextState.selectedPosition = null;
+  nextState.validTargets = [];
+  nextState.skillRangeIndicators = [];
+  nextState.activeActionType = null;
+  
+  return endTurn(nextState);
+};
+
+const getAdjacentSquareToTarget = (fromR: number, fromC: number, targetR: number, targetC: number): Position => {
+  const dr = Math.sign(targetR - fromR);
+  const dc = Math.sign(targetC - fromC);
+  return { r: targetR - dr, c: targetC - dc };
+};
+
+export const executeAttack = (gameState: GameState, from: Position, to: Position, aiPromotionType?: PieceType): GameState => {
+  const nextState = cloneGameState(gameState);
+  const attacker = nextState.board[from.r][from.c];
+  const target = nextState.board[to.r][to.c];
+  if (!attacker || !target) return nextState;
+
+  let damage = attacker.atk + attacker.conditions.empowered;
+  const defeated = resolveDamage(nextState, to.r, to.c, damage, attacker);
+
+  if (attacker.conditions.charmed > 0) {
+    // Frigid Puppetry
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const q = nextState.board[r][c];
+        if (q && q.type === 'QUEEN' && q.color === attacker.color) {
+          q.valor = (q.valor + 1);
+          nextState.history.push(`<P>Empress</P> gained <V>1 Valor</V> from <A>Frigid Puppetry</A>.`);
+        }
+      }
+    }
+  }
+
+  const notation = logAttack(nextState.turn, attacker, target, defeated);
+  nextState.history.push(notation);
+
+  // Movement resolution based on piece class
+  // Slide pieces move to nearest empty tile adjacent to target.
+  if (['QUEEN', 'ROOK', 'BISHOP'].includes(attacker.type)) {
+    const adjPos = getAdjacentSquareToTarget(from.r, from.c, to.r, to.c);
+    nextState.board[from.r][from.c] = null;
+    
+    if (defeated) {
+      // If defeated, attacker may advance onto vacated square (default to yes for MVP)
+      nextState.board[to.r][to.c] = attacker;
+    } else {
+      nextState.board[adjPos.r][adjPos.c] = attacker;
+    }
+  } 
+  // Step pieces
+  else if (['KING', 'PAWN', 'ROYAL_GUARD'].includes(attacker.type)) {
+    if (defeated) {
+      nextState.board[to.r][to.c] = attacker;
+      nextState.board[from.r][from.c] = null;
+    }
+  }
+  // Jump pieces
+  else if (attacker.type === 'KNIGHT') {
+    if (defeated) {
+      nextState.board[to.r][to.c] = attacker;
+      nextState.board[from.r][from.c] = null;
+    }
+  }
+
+  // Vanguard's Resolve & Promotion check after attack
+  if (attacker.type === 'PAWN' && defeated) {
+    const enemyBackRank = attacker.color === 'WHITE' ? 0 : 7;
+    const distanceToBackRank = Math.abs(to.r - enemyBackRank);
+    
+    // Gain resolve BEFORE triggering promotion (finalizing Resolve stat boosts)
+    if (distanceToBackRank <= 3 && !attacker.reached4thRank) {
+      attacker.reached4thRank = true;
+      gainResolve(attacker, 1);
+    }
+    if (distanceToBackRank <= 1 && !attacker.reached2ndRank) {
+      attacker.reached2ndRank = true;
+      gainResolve(attacker, 1);
+    }
+    
+    if (distanceToBackRank === 0) {
+      const playerType = nextState.setup[attacker.color === 'WHITE' ? 'playerWhite' : 'playerBlack'];
+      if (playerType === 'HUMAN') {
+         nextState.pendingPromotion = { r: to.r, c: to.c };
+      } else {
+         const promoType = aiPromotionType || 'ROOK';
+         attacker.type = promoType;
+         attacker.valor = 0;
+         let baseHp = 10;
+         let baseAtk = 4;
+         let pieceName = 'Iron Bastion';
+         if (promoType === 'KNIGHT') { baseHp = 8; baseAtk = 3; pieceName = 'Grand Paladin'; }
+         else if (promoType === 'BISHOP') { baseHp = 8; baseAtk = 3; pieceName = 'High Inquisitor'; }
+         attacker.maxHp = baseHp + (attacker.resolve >= 3 ? 1 : 0);
+         attacker.hp = attacker.maxHp;
+         attacker.atk = baseAtk + (attacker.resolve >= 2 ? 1 : 0) + (attacker.resolve >= 4 ? 1 : 0);
+         attacker.cooldowns.ability = 0;
+         attacker.cooldowns.passive = 0;
+         nextState.history.push(`<T>T${nextState.turn}.</T> <P>Soldier</P> has reached the end and promoted to <A>${pieceName}</A>!`);
+      }
+    }
+  }
+
+  attacker.hasMoved = true;
+  nextState.selectedPosition = null;
+  nextState.validTargets = [];
+  nextState.skillRangeIndicators = [];
+  nextState.activeActionType = null;
+  
+  return endTurn(nextState);
+};
+
+export const resolvePendingPromotion = (gameState: GameState, promotionType: 'ROOK' | 'KNIGHT' | 'BISHOP'): GameState => {
+  const nextState = cloneGameState(gameState);
+  if (!nextState.pendingPromotion) return nextState;
+  
+  const { r, c } = nextState.pendingPromotion;
+  const piece = nextState.board[r][c];
+  if (piece && piece.type === 'PAWN') {
+    piece.type = promotionType;
+    piece.valor = 0;
+    
+    // Set maxHp and atk based on type and resolve
+    if (promotionType === 'ROOK') {
+      piece.maxHp = 10 + (piece.resolve >= 3 ? 1 : 0);
+      piece.atk = 4 + (piece.resolve >= 2 ? 1 : 0) + (piece.resolve >= 4 ? 1 : 0);
+    } else if (promotionType === 'KNIGHT') {
+      piece.maxHp = 8 + (piece.resolve >= 3 ? 1 : 0);
+      piece.atk = 3 + (piece.resolve >= 2 ? 1 : 0) + (piece.resolve >= 4 ? 1 : 0);
+    } else if (promotionType === 'BISHOP') {
+      piece.maxHp = 8 + (piece.resolve >= 3 ? 1 : 0);
+      piece.atk = 3 + (piece.resolve >= 2 ? 1 : 0) + (piece.resolve >= 4 ? 1 : 0);
+    }
+    
+    piece.hp = piece.maxHp;
+    piece.cooldowns.ability = 0;
+    piece.cooldowns.passive = 0;
+    
+    const nameMap = { ROOK: 'Iron Bastion', KNIGHT: 'Grand Paladin', BISHOP: 'High Cleric' };
+    nextState.history.push(`<T>T${nextState.turn}.</T> <P>Soldier</P> has reached the end and promoted to <A>${nameMap[promotionType]}</A>!`);
+  }
+  
+  nextState.pendingPromotion = null;
+  return endTurn(nextState);
+};
+
+export const resolvePendingEvasion = (gameState: GameState, r: number, c: number, toR: number, toC: number): GameState => {
+  const nextState = cloneGameState(gameState);
+  if (!nextState.pendingEvasions || nextState.pendingEvasions.length === 0) return nextState;
+  
+  // Find the evasion matching r, c
+  const index = nextState.pendingEvasions.findIndex(e => e.r === r && e.c === c);
+  if (index !== -1) {
+    const target = nextState.board[r][c];
+    if (target && toR !== -1 && toC !== -1) { // -1, -1 means skip
+      // Move knight
+      nextState.board[toR][toC] = target;
+      nextState.board[r][c] = null;
+      nextState.history.push(`<P>Grand Paladin's</P> <A>Tactical Evasion</A> triggered, leaping to safety!`);
+    }
+    nextState.pendingEvasions.splice(index, 1);
+  }
+  
+  return nextState;
+};
+
+export const endTurn = (gameState: GameState): GameState => {
+  if (gameState.pendingPromotion) {
+     return gameState;
+  }
+  
+  // Check win condition (King HP)
+  let whiteKingDefeated = true;
+  let blackKingDefeated = true;
+  
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = gameState.board[r][c];
+      if (p && p.type === 'KING') {
+        if (p.color === 'WHITE' && p.hp > 0) whiteKingDefeated = false;
+        if (p.color === 'BLACK' && p.hp > 0) blackKingDefeated = false;
+      }
+    }
+  }
+
+  if (whiteKingDefeated) {
+    gameState.winner = 'BLACK';
+    gameState.statusMessage = 'Black Kingdom wins!';
+    return gameState;
+  }
+  if (blackKingDefeated) {
+    gameState.winner = 'WHITE';
+    gameState.statusMessage = 'White Kingdom wins!';
+    return gameState;
+  }
+
+  if (gameState.specialTurnState === 'START') {
+    gameState.specialTurnState = 'ACTIVE';
+    gameState.statusMessage = `Special Turn: King's Command is active! ${gameState.activeColor === 'WHITE' ? 'White' : 'Black'} has an extra action.`;
+    gameState.healedAllyIdsThisTurn = [];
+    gameState.knightValorGainedThisTurn = false;
+    return gameState;
+  }
+
+  if (gameState.specialTurnState === 'ACTIVE') {
+    gameState.specialTurnState = null;
+    gameState.statusMessage = `${gameState.activeColor === 'WHITE' ? 'White' : 'Black'} Kingdom to move.`;
+    gameState.healedAllyIdsThisTurn = [];
+    gameState.knightValorGainedThisTurn = false;
+    return gameState;
+  }
+
+  gameState.activeColor = gameState.activeColor === 'WHITE' ? 'BLACK' : 'WHITE';
+  gameState.turn++;
+  gameState.statusMessage = `${gameState.activeColor === 'WHITE' ? 'White' : 'Black'} Kingdom to move.`;
+  gameState.healedAllyIdsThisTurn = [];
+  gameState.knightValorGainedThisTurn = false;
+  
+  // Decrease cooldowns and conditions for the NEW active color
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = gameState.board[r][c];
+      if (p && p.color === gameState.activeColor) {
+        p.survivedDamageThisRound = false;
+        if (p.type === 'PAWN' && p.conditions.shielded) {
+          p.conditions.shielded = false;
+        }
+        if (p.cooldowns.ability > 0) {
+          p.cooldowns.ability--;
+          if (p.cooldowns.ability === 0 && p.type === 'ROOK') {
+            p.conditions.guarding = false;
+            if (p.protectedPieceId) {
+              const targetId = p.protectedPieceId;
+              for (let tr = 0; tr < 8; tr++) {
+                for (let tc = 0; tc < 8; tc++) {
+                  const targetPiece = gameState.board[tr][tc];
+                  if (targetPiece && targetPiece.id === targetId) {
+                    targetPiece.conditions.guarded = Math.max(0, targetPiece.conditions.guarded - 2);
+                  }
+                }
+              }
+              delete p.protectedPieceId;
+            }
+          }
+        }
+        if (p.cooldowns.passive > 0) {
+          p.cooldowns.passive--;
+          if (p.cooldowns.passive === 0 && p.type === 'KING' && p.unyieldingUsed) {
+            p.conditions.empowered = Math.max(0, p.conditions.empowered - 6);
+            p.conditions.haste = false;
+          }
+        }
+        if (p.bastionTurns !== undefined && p.bastionTurns > 0) {
+          p.bastionTurns--;
+          if (p.bastionTurns === 0) {
+            p.conditions.guarding = false;
+            p.conditions.armored = Math.max(0, p.conditions.armored - 1);
+            gameState.history.push(`<T>T${gameState.turn}.</T> <P>Iron Bastion's</P> <A>Bastion</A> state has expired.`);
+          }
+        }
+        if (p.conditions.frozen > 0) p.conditions.frozen--;
+      }
+      
+      if (p && p.conditions.charmed > 0) {
+        p.conditions.charmed--;
+        if (p.conditions.charmed === 0) {
+          if (p.conditions.originalColor) {
+            p.color = p.conditions.originalColor;
+            delete p.conditions.originalColor;
+          }
+          const pieceNameStr = p.type === 'KING' ? 'King' : p.type === 'QUEEN' ? 'Empress' : p.type === 'ROOK' ? 'Iron Bastion' : p.type === 'KNIGHT' ? 'Grand Paladin' : p.type === 'BISHOP' ? 'High Cleric' : p.type === 'ROYAL_GUARD' ? 'Guard' : 'Soldier';
+          gameState.history.push(`<T>T${gameState.turn}.</T> <P>${pieceNameStr}</P> is no longer charmed.`);
+        }
+      }
+    }
+  }
+
+  const royals = ['KING', 'QUEEN', 'ROYAL_GUARD'];
+  const priority: Record<string, number> = {
+    'KING': 1, 'QUEEN': 2, 'ROOK': 3, 'KNIGHT': 4, 'BISHOP': 5, 'ROYAL_GUARD': 6, 'PAWN': 7
+  };
+
+  const pieceNameStr = (type: string) => type === 'KING' ? 'King' : type === 'QUEEN' ? 'Empress' : type === 'ROOK' ? 'Iron Bastion' : type === 'KNIGHT' ? 'Grand Paladin' : type === 'BISHOP' ? 'High Cleric' : type === 'ROYAL_GUARD' ? 'Guard' : 'Soldier';
+
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = gameState.board[r][c];
+      if (p) {
+        p.conditions.suppressed = false;
+        if (p.conditions.charmed > 0) p.conditions.suppressed = true;
+      }
+    }
+  }
+
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = gameState.board[r][c];
+      if (!p) continue;
+      
+      // QUEEN: Sovereign Aura
+      if (p.type === 'QUEEN' && p.conditions.charmed === 0) {
+        const dirs = [[-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]];
+        dirs.forEach(([dr, dc]) => {
+          const nr = r + dr, nc = c + dc;
+          if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+            const target = gameState.board[nr][nc];
+            if (target && target.color !== p.color && !royals.includes(target.type)) {
+              target.conditions.suppressed = true;
+            }
+          }
+        });
+      }
+
+      if (p.color === gameState.activeColor) {
+        // ROOK: Iron Shell
+        if (p.type === 'ROOK' && !p.conditions.shielded && p.cooldowns.passive === 0) {
+          if (!gameState.pendingStartOfTurnPassives) gameState.pendingStartOfTurnPassives = [];
+          gameState.pendingStartOfTurnPassives.push({ r, c, type: 'ROOK' });
+        }
+        
+        // BISHOP: Divine Blessing
+        if (p.type === 'BISHOP' && p.cooldowns.passive === 0) {
+          if (!gameState.pendingStartOfTurnPassives) gameState.pendingStartOfTurnPassives = [];
+          gameState.pendingStartOfTurnPassives.push({ r, c, type: 'BISHOP' });
+        }
+      }
+    }
+  }
+
+  syncBastionGuardedState(gameState);
+
+  return gameState;
+};
+
+export const resolveNextPassive = (gameState: GameState): GameState => {
+  const nextState = cloneGameState(gameState);
+  if (!nextState.pendingStartOfTurnPassives || nextState.pendingStartOfTurnPassives.length === 0) {
+    return nextState;
+  }
+  
+  const passive = nextState.pendingStartOfTurnPassives.shift()!;
+  const p = nextState.board[passive.r][passive.c];
+  if (!p) return nextState;
+
+  if (passive.type === 'ROOK') {
+    p.conditions.shielded = true;
+    p.cooldowns.passive = 5;
+    nextState.history.push(`<T>T${nextState.turn}.</T> <P>Iron Bastion's</P> <A>Iron shell</A> restored its protective shield.`);
+  } else if (passive.type === 'BISHOP') {
+    const royals = ['KING', 'QUEEN', 'ROYAL_GUARD'];
+    const priority: Record<string, number> = {
+      'KING': 1, 'QUEEN': 2, 'ROOK': 3, 'KNIGHT': 4, 'BISHOP': 5, 'ROYAL_GUARD': 6, 'PAWN': 7
+    };
+    const pieceNameStr = (type: string) => type === 'KING' ? 'King' : type === 'QUEEN' ? 'Empress' : type === 'ROOK' ? 'Iron Bastion' : type === 'KNIGHT' ? 'Grand Paladin' : type === 'BISHOP' ? 'High Cleric' : type === 'ROYAL_GUARD' ? 'Guard' : 'Soldier';
+
+    let bestAlly = null;
+    let bestPriority = 99;
+    for (let ar = 0; ar < 8; ar++) {
+      for (let ac = 0; ac < 8; ac++) {
+        if (ar === passive.r && ac === passive.c) continue;
+        if (Math.abs(ar - passive.r) > 3 || Math.abs(ac - passive.c) > 3) continue;
+        const ally = nextState.board[ar][ac];
+        if (ally && ally.color === p.color && ally.hp < ally.maxHp) {
+          // A target cannot be healed by multiple bishops in the same turn
+          if (nextState.healedAllyIdsThisTurn && nextState.healedAllyIdsThisTurn.includes(ally.id)) {
+            continue;
+          }
+          const prio = priority[ally.type] || 99;
+          if (prio < bestPriority) {
+            bestPriority = prio;
+            bestAlly = ally;
+          } else if (prio === bestPriority && bestAlly) {
+            if (ally.hp < bestAlly.hp) {
+               bestAlly = ally;
+            }
+          }
+        }
+      }
+    }
+    if (bestAlly) {
+      bestAlly.hp += 1;
+      p.cooldowns.passive = 3;
+      trackStat(p, 1, nextState);
+      if (!nextState.healedAllyIdsThisTurn) {
+        nextState.healedAllyIdsThisTurn = [];
+      }
+      nextState.healedAllyIdsThisTurn.push(bestAlly.id);
+      nextState.history.push(`<T>T${nextState.turn}.</T> <P>High Cleric's</P> <A>Divine Blessing</A> restored <V>1 HP</V> to ally ${pieceNameStr(bestAlly.type)}.`);
+    }
+  }
+
+  return nextState;
+};
+
